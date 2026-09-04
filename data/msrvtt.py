@@ -60,8 +60,14 @@ class MSRVTT(Dataset):
     def _load_metadata(self):
         with open(self.meta_path, "r+") as file:
             metadata = json.load(file)
-        
-        self.metadata = metadata["sentences"]
+
+        sentences = metadata["sentences"]
+        filtered = [s for s in sentences if os.path.isfile(self._get_video_path(s))]
+        if len(filtered) < len(sentences):
+            print(f"[MSRVTT] {len(sentences) - len(filtered)}/{len(sentences)} caption entries "
+                  f"reference videos not found in {self.data_dir} -- filtering them out. "
+                  f"{len(filtered)} usable entries remain.")
+        self.metadata = filtered
     
     def _get_video_path(self, sample):
         video_path = os.path.join(self.data_dir, sample["video_id"] + ".mp4")
