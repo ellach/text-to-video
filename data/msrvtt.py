@@ -142,7 +142,7 @@ class MSRVTT(Dataset):
             assert (frames.shape[2], frames.shape[3]) == (self.resolution[0], self.resolution[1]), f"frames={frames.shape}, self.resolution={self.resolution}"
 
         frames = (frames / 255 - 0.5) * 2
-        fps_clip = fps_ori // frame_stride
+        fps_clip = int(fps_ori // frame_stride)
         if self.fps_max is not None and fps_clip > self.fps_max:
             fps_clip = self.fps_max
         
