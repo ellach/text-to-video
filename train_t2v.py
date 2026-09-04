@@ -82,10 +82,10 @@ def parse_args(input_args=None):
 
 
 def main(args=None):
-    assert torch.cuda.is_available(), "Training currently requires at least one GPU."
-
     accelerator = Accelerator()
     device = accelerator.device
+    if accelerator.is_main_process:
+        print(f"Training on device: {device}")
     set_seed(args.seed)
 
     if accelerator.is_main_process:
