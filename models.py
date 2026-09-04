@@ -600,6 +600,21 @@ class GenTronT2V(nn.Module):
         x = rearrange(x, "(b f) c h w -> b c f h w", f=f).contiguous()
         return x
     
+    def forward_with_cfg(self, x, t, y, cfg_scale, mask=None):
+        """Standard 2-way classifier-free guidance for video. (The repo's
+        forward_with_cfg_and_mfg below has unrelated bugs -- wrong split
+        dimension and a batch-size assumption that doesn't match how
+        sample_t2v.py builds its CFG batch -- so this is the method actually
+        used for sampling.)"""
+        half = x[: len(x) // 2]
+        combined = torch.cat([half, half], dim=0)
+        model_out = self.forward(combined, t, y, mask)
+        eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        eps = torch.cat([half_eps, half_eps], dim=0)
+        return torch.cat([eps, rest], dim=1)
+
     def forward_with_cfg_and_mfg(self, x, t, y, cfg_scale, mfg_scale, mask=None, motion_free_mask=None):
         third = x[: len(x) // 3]
         combined = torch.cat([third, third, third], dim=0)

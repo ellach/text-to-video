@@ -23,7 +23,6 @@ def parse_args(input_args=None):
     parser.add_argument("--fps", type=int, default=4)
     parser.add_argument("--num_classes", type=int, default=1000)
     parser.add_argument("--cfg_scale", type=float, default=7.5)
-    parser.add_argument("--mfg_scale", type=float, default=1.3)
     parser.add_argument("--num_sampling_steps", type=int, default=250)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ckpt", type=str, default=None, help="Optional path to a GenTron checkpoint.")
@@ -80,10 +79,10 @@ def main(args):
     z = torch.cat([z, z], 0)
     y = torch.cat([y, y_null], 0)
     mask = torch.cat([mask, uncond_mask], 0)
-    model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, mfg_scale=args.mfg_scale, mask=mask)
+    model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, mask=mask)
 
     samples = diffusion.p_sample_loop(
-        model.forward_with_cfg_and_mfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
+        model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
     )
     samples, _ = samples.chunk(2, dim=0)
     b, _, _, _, _ = samples.shape
