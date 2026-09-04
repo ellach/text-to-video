@@ -1,4 +1,5 @@
 import argparse
+import os
 import torch
 from diffusers.models import AutoencoderKL
 from download import find_model
@@ -65,10 +66,10 @@ def main(args):
     tokenizer = AutoTokenizer.from_pretrained(args.text_encoder)
     text_encoder = CLIPTextModel.from_pretrained(args.text_encoder).to(device)
 
-    z = torch.randn(3, 4, args.video_length, latent_size, latent_size, device=device)
-    y = ["a few cartoon characters are having a conversation", "a few cartoon characters are having a conversation", "a few cartoon characters are having a conversation"]
+    z = torch.randn(args.num_samples, 4, args.video_length, latent_size, latent_size, device=device)
+    y = [args.prompt] * args.num_samples
     y_inputs = tokenizer(y, padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
-    y_null_inputs = tokenizer([""] * 3, padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
+    y_null_inputs = tokenizer([""] * args.num_samples, padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
     tokens = y_inputs["input_ids"].to(device)
     uncond_tokens = y_null_inputs["input_ids"].to(device)
     y = text_encoder(input_ids=tokens).last_hidden_state
@@ -90,10 +91,14 @@ def main(args):
     samples = vae.decode(samples / 0.18215).sample
     samples = rearrange(samples, "(b f) c h w -> b c f h w", b=b).contiguous()
 
+    os.makedirs(args.out_dir, exist_ok=True)
     for i, sample in enumerate(samples):
         sample = sample.squeeze(0)
         sample = rearrange(sample, "c f h w -> f h w c").contiguous()
-        write_video(f"{i}.mp4", sample.cpu(), args.fps, "h264")
+        sample = ((sample.clamp(-1, 1) + 1) / 2 * 255).to(torch.uint8)
+        out_path = os.path.join(args.out_dir, f"sample_{i}.mp4")
+        write_video(out_path, sample.cpu(), args.fps, "h264")
+        print(f"Saved {out_path}")
 
 
 if __name__ == "__main__":

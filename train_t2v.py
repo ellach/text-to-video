@@ -162,9 +162,9 @@ def main(args=None):
             x = data["video"].to(device)
             with torch.no_grad():
                 b, _, _, _, _ = x.shape
-                x = rearrange(x, "b f c h w -> (b f) c h w").contiguous()
+                x = rearrange(x, "b c f h w -> (b f) c h w").contiguous()
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-                x = rearrange(x, "(b f) c h w -> b f c h w", b=b).contiguous()
+                x = rearrange(x, "(b f) c h w -> b c f h w", b=b).contiguous()
                 y = data["caption"]
                 y_inputs = tokenizer(y, padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
                 tokens = y_inputs["input_ids"].to(device)
