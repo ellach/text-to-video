@@ -1,0 +1,11 @@
+pretrained_models/
+results/
+samples/
+*.pt
+*.pth
+__pycache__/
+*.pyc
+.DS_Store
+msrvtt_data/
+MSRVTT/
+Webvid/

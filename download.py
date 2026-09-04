@@ -1,0 +1,61 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""
+Functions for downloading pre-trained DiT models
+"""
+from torchvision.datasets.utils import download_url
+import torch
+import os
+
+
+# Maps our local GenTron checkpoint name -> the actual filename hosted on
+# dl.fbaipublicfiles.com (the upstream DiT release). These GenTron files are
+# just the original DiT weights; only the local name differs.
+pretrained_models = {
+    'GenTron-T2I-XL-2-512x512.pt': 'DiT-XL-2-512x512.pt',
+    'GenTron-T2I-XL-2-256x256.pt': 'DiT-XL-2-256x256.pt',
+}
+
+
+def find_model(model_name):
+    """
+    Finds a pre-trained GenTron model, downloading it if necessary. Alternatively, loads a model from a local path.
+    """
+    if model_name in pretrained_models:  # Find/download our pre-trained DiT checkpoints
+        return download_model(model_name)
+    else:  # Load a custom GenTron checkpoint:
+        assert os.path.isfile(model_name), f'Could not find GenTron checkpoint at {model_name}'
+        checkpoint = torch.load(model_name, map_location=lambda storage, loc: storage)
+        if "ema" in checkpoint:  # supports checkpoints from train.py
+            checkpoint = checkpoint["ema"]
+        return checkpoint
+
+
+def download_model(model_name):
+    """
+    Downloads a pre-trained DiT model from the web and saves it locally under
+    the GenTron checkpoint name.
+    """
+    assert model_name in pretrained_models
+    remote_name = pretrained_models[model_name]
+    local_path = f'pretrained_models/{model_name}'
+    if not os.path.isfile(local_path):
+        os.makedirs('pretrained_models', exist_ok=True)
+        web_path = f'https://dl.fbaipublicfiles.com/DiT/models/{remote_name}'
+        download_url(web_path, 'pretrained_models', filename=remote_name)
+        downloaded_path = f'pretrained_models/{remote_name}'
+        if downloaded_path != local_path:
+            os.replace(downloaded_path, local_path)
+    model = torch.load(local_path, map_location=lambda storage, loc: storage)
+    return model
+
+
+if __name__ == "__main__":
+    # Download all GenTron checkpoints
+    for model in pretrained_models:
+        download_model(model)
+    print('Done.')
