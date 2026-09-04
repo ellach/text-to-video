@@ -60,7 +60,7 @@ def parse_args(input_args=None):
                          help="Which dataset loader to use for --meta_path/--data_dir.")
     parser.add_argument("--results_dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(GenTron_models.keys()), default="GenTron-T2V-XL/2")
-    parser.add_argument("--image_size", type=int, choices=[256, 512], default=512)
+    parser.add_argument("--image_size", type=int, choices=[128, 256, 512], default=512)
     parser.add_argument("--video_length", type=int, default=8)
     parser.add_argument("--frame_stride", type=int, default=6)
     parser.add_argument("--num_classes", type=int, default=1000)
