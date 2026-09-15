@@ -18,7 +18,7 @@ def parse_args(input_args=None):
     parser.add_argument("--model", type=str, choices=list(GenTron_models.keys()), default="GenTron-T2V-XL/2")
     parser.add_argument("--vae", type=str, default="stabilityai/sd-vae-ft-ema")
     parser.add_argument("--text_encoder", type=str, default="openai/clip-vit-large-patch14")
-    parser.add_argument("--image_size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--image_size", type=int, choices=[128, 256, 512], default=256)
     parser.add_argument("--video_length", type=int, default=8)
     parser.add_argument("--fps", type=int, default=4)
     parser.add_argument("--num_classes", type=int, default=1000)
