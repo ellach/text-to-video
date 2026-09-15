@@ -1,10 +1,10 @@
 import argparse
 import os
+import imageio
 import torch
 from diffusers.models import AutoencoderKL
 from download import find_model
 from einops import rearrange, repeat
-from torchvision.io import write_video
 from torchvision.utils import save_image
 from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, CLIPTextModel
 
@@ -96,7 +96,7 @@ def main(args):
         sample = rearrange(sample, "c f h w -> f h w c").contiguous()
         sample = ((sample.clamp(-1, 1) + 1) / 2 * 255).to(torch.uint8)
         out_path = os.path.join(args.out_dir, f"sample_{i}.mp4")
-        write_video(out_path, sample.cpu(), args.fps, "h264")
+        imageio.mimwrite(out_path, sample.cpu().numpy(), fps=args.fps, codec="libx264", quality=8)
         print(f"Saved {out_path}")
 
 
