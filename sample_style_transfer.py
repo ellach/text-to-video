@@ -94,6 +94,12 @@ def parse_args(input_args=None):
                          help="Text prompt conditioning the generation (still required -- GenTron-T2V "
                               "always generates conditioned on text, style transfer happens on top of that).")
     parser.add_argument("--out_dir", type=str, default=".")
+    parser.add_argument("--output_type", type=str, choices=["video", "image"], default="video",
+                         help="'video' saves the full generated clip as .mp4 (default). 'image' saves "
+                              "only a single representative frame as .png instead -- the model still "
+                              "generates the full video internally (video_length frames), a frame is "
+                              "just extracted afterward, since GenTron-T2V wasn't trained to produce "
+                              "single-frame output directly.")
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -141,6 +147,29 @@ def encode_to_latent(vae, video_tensor, device):
     return latent
 
 
+def save_output(sample_fhwc_uint8, out_path_base, output_type, fps):
+    """
+    Save one generated sample as either a video or a single image, per
+    --output_type. `sample_fhwc_uint8` is a (F, H, W, C) uint8 numpy array
+    (already denormalized to [0, 255]).
+
+    Image mode takes the middle frame of the generated clip rather than the
+    first, since diffusion video models are often least motion-blurred /
+    most representative partway through a clip rather than at its very
+    start.
+    """
+    if output_type == "video":
+        out_path = f"{out_path_base}.mp4"
+        imageio.mimwrite(out_path, sample_fhwc_uint8, fps=fps, codec="libx264", quality=8)
+    else:
+        num_frames = sample_fhwc_uint8.shape[0]
+        middle_frame = sample_fhwc_uint8[num_frames // 2]
+        out_path = f"{out_path_base}.png"
+        imageio.imwrite(out_path, middle_frame)
+    print(f"Saved {out_path}")
+    return out_path
+
+
 def run_plain_generation(args, model, vae, tokenizer, text_encoder, device):
     """
     No style transfer requested: generate ordinary text-to-video output from
@@ -178,9 +207,8 @@ def run_plain_generation(args, model, vae, tokenizer, text_encoder, device):
     for i, sample in enumerate(samples):
         sample = rearrange(sample, "c f h w -> f h w c").contiguous()
         sample = ((sample.clamp(-1, 1) + 1) / 2 * 255).to(torch.uint8)
-        out_path = os.path.join(args.out_dir, f"sample_{i}.mp4")
-        imageio.mimwrite(out_path, sample.cpu().numpy(), fps=args.fps, codec="libx264", quality=8)
-        print(f"Saved {out_path}")
+        out_path_base = os.path.join(args.out_dir, f"sample_{i}")
+        save_output(sample.cpu().numpy(), out_path_base, args.output_type, args.fps)
 
 
 def main(args):
@@ -273,9 +301,8 @@ def main(args):
     sample = samples[0]
     sample = rearrange(sample, "c f h w -> f h w c").contiguous()
     sample = ((sample.clamp(-1, 1) + 1) / 2 * 255).to(torch.uint8)
-    out_path = os.path.join(args.out_dir, "style_transfer_result.mp4")
-    imageio.mimwrite(out_path, sample.cpu().numpy(), fps=args.fps, codec="libx264", quality=8)
-    print(f"Saved {out_path}")
+    out_path_base = os.path.join(args.out_dir, "style_transfer_result")
+    save_output(sample.cpu().numpy(), out_path_base, args.output_type, args.fps)
 
 
 if __name__ == "__main__":
