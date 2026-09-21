@@ -80,10 +80,16 @@ def parse_args(input_args=None):
                               "Doesn't need to match --num_sampling_steps.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ckpt", type=str, required=True, help="Path to a trained GenTron-T2V checkpoint.")
-    parser.add_argument("--content_video", type=str, required=True,
-                         help="Real video whose STRUCTURE/MOTION is preserved.")
-    parser.add_argument("--style_video", type=str, required=True,
-                         help="Real video whose COLOR/TONE is transferred onto the content.")
+    parser.add_argument("--content_video", type=str, default=None,
+                         help="Real video whose STRUCTURE/MOTION is preserved. Optional -- if omitted "
+                              "along with --style_video, generates a normal (un-styled) video from text, "
+                              "same as sample_t2v.py.")
+    parser.add_argument("--style_video", type=str, default=None,
+                         help="Real video whose COLOR/TONE is transferred onto the content. Optional -- "
+                              "if omitted, no style transfer is applied and this behaves like plain "
+                              "text-to-video generation.")
+    parser.add_argument("--num_samples", type=int, default=1,
+                         help="Only used when --style_video is omitted (plain generation mode).")
     parser.add_argument("--prompt", type=str, required=True,
                          help="Text prompt conditioning the generation (still required -- GenTron-T2V "
                               "always generates conditioned on text, style transfer happens on top of that).")
@@ -135,6 +141,48 @@ def encode_to_latent(vae, video_tensor, device):
     return latent
 
 
+def run_plain_generation(args, model, vae, tokenizer, text_encoder, device):
+    """
+    No style transfer requested: generate ordinary text-to-video output from
+    random noise, exactly like sample_t2v.py. This is the fallback path used
+    whenever --style_video is omitted.
+    """
+    latent_size = args.image_size // 8
+    z = torch.randn(args.num_samples, 4, args.video_length, latent_size, latent_size, device=device)
+    y_inputs = tokenizer([args.prompt] * args.num_samples, padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
+    y_null_inputs = tokenizer([""] * args.num_samples, padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
+    tokens = y_inputs["input_ids"].to(device)
+    uncond_tokens = y_null_inputs["input_ids"].to(device)
+    y = text_encoder(input_ids=tokens).last_hidden_state
+    y_null = text_encoder(input_ids=uncond_tokens).last_hidden_state
+    mask = y_inputs["attention_mask"].bool().to(device)
+    uncond_mask = y_null_inputs["attention_mask"].bool().to(device)
+
+    z = torch.cat([z, z], 0)
+    y = torch.cat([y, y_null], 0)
+    mask = torch.cat([mask, uncond_mask], 0)
+    model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, mask=mask)
+
+    sample_diffusion = create_diffusion(str(args.num_sampling_steps))
+    print(f"No --style_video given -- generating plain text-to-video output ({args.num_sampling_steps} steps)...")
+    samples = sample_diffusion.p_sample_loop(
+        model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
+    )
+    samples, _ = samples.chunk(2, dim=0)
+    b, _, _, _, _ = samples.shape
+    samples = rearrange(samples, "b c f h w -> (b f) c h w").contiguous()
+    samples = vae.decode(samples / 0.18215).sample
+    samples = rearrange(samples, "(b f) c h w -> b c f h w", b=b).contiguous()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    for i, sample in enumerate(samples):
+        sample = rearrange(sample, "c f h w -> f h w c").contiguous()
+        sample = ((sample.clamp(-1, 1) + 1) / 2 * 255).to(torch.uint8)
+        out_path = os.path.join(args.out_dir, f"sample_{i}.mp4")
+        imageio.mimwrite(out_path, sample.cpu().numpy(), fps=args.fps, codec="libx264", quality=8)
+        print(f"Saved {out_path}")
+
+
 def main(args):
     torch.manual_seed(args.seed)
     torch.set_grad_enabled(False)
@@ -156,6 +204,22 @@ def main(args):
     vae = AutoencoderKL.from_pretrained(args.vae).to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.text_encoder)
     text_encoder = CLIPTextModel.from_pretrained(args.text_encoder).to(device)
+
+    if args.style_video is None:
+        if args.content_video is not None:
+            print("--content_video was given without --style_video: ignoring it and "
+                  "generating a normal (un-styled) video from --prompt alone, since "
+                  "style transfer needs both to do anything.")
+        run_plain_generation(args, model, vae, tokenizer, text_encoder, device)
+        return
+
+    if args.content_video is None:
+        raise ValueError(
+            "--style_video was given but --content_video was not. Style transfer needs "
+            "both: --content_video (structure/motion to preserve) and --style_video "
+            "(color/tone to transfer). Provide both, or omit --style_video entirely for "
+            "plain text-to-video generation."
+        )
 
     # --- Step 1: load and encode content/style videos ---
     print("Loading and encoding content/style videos...")
