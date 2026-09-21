@@ -597,6 +597,53 @@ class GaussianDiffusion:
 
         return {"sample": mean_pred, "pred_xstart": out["pred_xstart"]}
 
+    def ddim_reverse_sample_loop(
+        self,
+        model,
+        image,
+        clip_denoised=False,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+    ):
+        """
+        Fully invert a real latent (e.g. a VAE-encoded image or video, NOT
+        random noise) into its corresponding noise via the deterministic
+        DDIM reverse ODE, running t = 0, 1, ..., T-1 in order (the mirror of
+        ddim_sample_loop_progressive, which runs t = T-1, ..., 0).
+
+        This is the "DDIM inversion" step needed by Initial Latent AdaIN
+        style transfer (and other inversion-based editing techniques): it
+        recovers the noise x_T that the model would have produced `image`
+        from, so that noise can be manipulated (e.g. AdaIN'd toward a style
+        image's inverted noise) before being re-denoised.
+        """
+        if device is None:
+            device = next(model.parameters()).device
+        img = image
+        indices = list(range(self.num_timesteps))
+
+        if progress:
+            from tqdm.auto import tqdm
+            indices = tqdm(indices)
+
+        for i in indices:
+            t = th.tensor([i] * image.shape[0], device=device)
+            with th.no_grad():
+                out = self.ddim_reverse_sample(
+                    model,
+                    img,
+                    t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    cond_fn=cond_fn,
+                    model_kwargs=model_kwargs,
+                )
+                img = out["sample"]
+        return img
+
     def ddim_sample_loop(
         self,
         model,
