@@ -65,10 +65,12 @@ import argparse
 import os
 
 import imageio
+import numpy as np
 import torch
 from decord import VideoReader, cpu
 from diffusers.models import AutoencoderKL
 from einops import rearrange
+from PIL import Image, ImageFilter
 from torchvision import transforms
 from transformers import AutoConfig, AutoTokenizer, CLIPTextModel
 
@@ -76,6 +78,95 @@ from diffusion import create_diffusion
 from diffusion.style_transfer import adain_latent, invert_to_noise
 from download import find_model
 from models import GenTron_models
+
+
+# Facebook Stories, Instagram Stories, and WhatsApp Status all specifically
+# require 9:16 vertical video (1080x1920 recommended); Telegram accepts any
+# aspect ratio (up to 2GB), so 9:16 is also fine there. One export format
+# satisfies all four platforms -- no need for per-platform profiles.
+PLATFORM_CANVAS_W = 1080
+PLATFORM_CANVAS_H = 1920
+PLATFORM_MIN_DURATION_SEC = 3.0  # Facebook/Instagram Stories' hard minimum
+PLATFORM_MAX_FILE_SIZE_MB = 16   # WhatsApp Status' cap -- the tightest of the four
+
+
+def fit_to_vertical_canvas(frames_fhwc_uint8, canvas_w=PLATFORM_CANVAS_W, canvas_h=PLATFORM_CANVAS_H):
+    """
+    Place square (or any-aspect-ratio) generated frames onto a proper 9:16
+    vertical canvas, the format Facebook/Instagram Stories and WhatsApp
+    Status all require (and Telegram accepts fine too).
+
+    Rather than letting the platform auto-crop a square video to 9:16 (which
+    would cut off whatever's on the left/right of the frame) or adding plain
+    black bars, this fills the canvas with a blurred, scaled-up version of
+    the same frame as a backdrop -- the common technique apps use for
+    square-to-vertical conversion -- with the original frame centered on
+    top at full quality.
+
+    Args:
+        frames_fhwc_uint8: (F, H, W, C) uint8 numpy array.
+        canvas_w, canvas_h: target canvas size, default 1080x1920 (9:16).
+
+    Returns:
+        (F, canvas_h, canvas_w, C) uint8 numpy array.
+    """
+    num_frames, h, w, c = frames_fhwc_uint8.shape
+    out_frames = np.empty((num_frames, canvas_h, canvas_w, c), dtype=np.uint8)
+
+    # Foreground: scale the original frame to fill the canvas WIDTH, height
+    # follows from the aspect ratio (for a square input this makes it
+    # canvas_w x canvas_w, centered vertically).
+    fg_w = canvas_w
+    fg_h = max(1, round(h * (canvas_w / w)))
+
+    for i in range(num_frames):
+        frame = Image.fromarray(frames_fhwc_uint8[i])
+
+        # Background: scale to COVER the whole canvas (may overflow one
+        # dimension), then center-crop to exactly canvas size, then blur.
+        scale = max(canvas_w / w, canvas_h / h)
+        bg_w, bg_h = max(1, round(w * scale)), max(1, round(h * scale))
+        background = frame.resize((bg_w, bg_h), Image.LANCZOS)
+        left = (bg_w - canvas_w) // 2
+        top = (bg_h - canvas_h) // 2
+        background = background.crop((left, top, left + canvas_w, top + canvas_h))
+        background = background.filter(ImageFilter.GaussianBlur(radius=30))
+
+        foreground = frame.resize((fg_w, fg_h), Image.LANCZOS)
+        paste_y = (canvas_h - fg_h) // 2
+
+        canvas = background.copy()
+        canvas.paste(foreground, (0, paste_y))
+        out_frames[i] = np.array(canvas)
+
+    return out_frames
+
+
+def ensure_minimum_duration(num_frames, fps, min_duration_sec=PLATFORM_MIN_DURATION_SEC):
+    """
+    Facebook/Instagram Stories reject videos under 3 seconds. If the
+    requested --fps would produce a shorter clip than that from the
+    generated frame count, lower fps just enough to clear the minimum
+    (stretching playback, not adding frames) rather than fail silently at
+    upload time on the actual platform.
+    """
+    duration = num_frames / fps
+    if duration >= min_duration_sec:
+        return fps
+    adjusted_fps = num_frames / min_duration_sec
+    print(f"Note: {num_frames} frames at {fps} fps = {duration:.1f}s, under the "
+          f"{min_duration_sec:.0f}s minimum Facebook/Instagram Stories require. "
+          f"Lowering playback to {adjusted_fps:.2f} fps ({min_duration_sec:.0f}s total) instead.")
+    return adjusted_fps
+
+
+def check_file_size(path, max_mb=PLATFORM_MAX_FILE_SIZE_MB):
+    size_mb = os.path.getsize(path) / (1024 * 1024)
+    if size_mb > max_mb:
+        print(f"WARNING: {path} is {size_mb:.1f}MB, over WhatsApp Status' {max_mb}MB limit "
+              f"(Facebook/Instagram/Telegram limits are far higher, this won't affect them). "
+              f"Re-export at a lower resolution or shorter duration for WhatsApp specifically.")
+    return size_mb
 
 
 def parse_args(input_args=None):
@@ -130,6 +221,12 @@ def parse_args(input_args=None):
                               "generates the full video internally (video_length frames), a frame is "
                               "just extracted afterward, since GenTron-T2V wasn't trained to produce "
                               "single-frame output directly.")
+    parser.add_argument("--no_platform_format", action="store_true",
+                         help="By default, output is fit to a 9:16 vertical canvas (1080x1920) and, for "
+                              "video, checked against Facebook/Instagram Stories' 3-second minimum "
+                              "duration -- this single format works for Facebook Stories, Instagram "
+                              "Stories, WhatsApp Status, and Telegram. Pass this flag to get the raw "
+                              "square output instead, with no platform formatting applied.")
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -177,7 +274,7 @@ def encode_to_latent(vae, video_tensor, device):
     return latent
 
 
-def save_output(sample_fhwc_uint8, out_path_base, output_type, fps):
+def save_output(sample_fhwc_uint8, out_path_base, output_type, fps, platform_format=True):
     """
     Save one generated sample as either a video or a single image, per
     --output_type. `sample_fhwc_uint8` is a (F, H, W, C) uint8 numpy array
@@ -187,10 +284,26 @@ def save_output(sample_fhwc_uint8, out_path_base, output_type, fps):
     first, since diffusion video models are often least motion-blurred /
     most representative partway through a clip rather than at its very
     start.
+
+    When platform_format=True (the default), output is fit to a 9:16
+    vertical canvas and, for video, checked against the minimum duration
+    Facebook/Instagram Stories require -- see fit_to_vertical_canvas() and
+    ensure_minimum_duration() above for what that actually does and why.
+    This single format satisfies Facebook Stories, Instagram Stories,
+    WhatsApp Status, and Telegram simultaneously (confirmed against each
+    platform's current published specs), so there's no need for separate
+    per-platform exports.
     """
+    if platform_format:
+        sample_fhwc_uint8 = fit_to_vertical_canvas(sample_fhwc_uint8)
+
     if output_type == "video":
+        if platform_format:
+            fps = ensure_minimum_duration(sample_fhwc_uint8.shape[0], fps)
         out_path = f"{out_path_base}.mp4"
         imageio.mimwrite(out_path, sample_fhwc_uint8, fps=fps, codec="libx264", quality=8)
+        if platform_format:
+            check_file_size(out_path)
     else:
         num_frames = sample_fhwc_uint8.shape[0]
         middle_frame = sample_fhwc_uint8[num_frames // 2]
@@ -238,7 +351,7 @@ def run_plain_generation(args, model, vae, tokenizer, text_encoder, device):
         sample = rearrange(sample, "c f h w -> f h w c").contiguous()
         sample = ((sample.clamp(-1, 1) + 1) / 2 * 255).to(torch.uint8)
         out_path_base = os.path.join(args.out_dir, f"sample_{i}")
-        save_output(sample.cpu().numpy(), out_path_base, args.output_type, args.fps)
+        save_output(sample.cpu().numpy(), out_path_base, args.output_type, args.fps, platform_format=not args.no_platform_format)
 
 
 def main(args):
@@ -365,7 +478,7 @@ def main(args):
     sample = rearrange(sample, "c f h w -> f h w c").contiguous()
     sample = ((sample.clamp(-1, 1) + 1) / 2 * 255).to(torch.uint8)
     out_path_base = os.path.join(args.out_dir, "style_transfer_result")
-    save_output(sample.cpu().numpy(), out_path_base, args.output_type, args.fps)
+    save_output(sample.cpu().numpy(), out_path_base, args.output_type, args.fps, platform_format=not args.no_platform_format)
 
 
 if __name__ == "__main__":
