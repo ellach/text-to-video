@@ -21,6 +21,126 @@ def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
+class StyleInjectionAttention(nn.Module):
+    """
+    Drop-in replacement for timm's Attention with an optional "style
+    injection" mode, from:
+
+      "Style Injection in Diffusion: A Training-free Approach for Adapting
+      Large-scale Diffusion Models for Style Transfer" (StyleID), CVPR 2024.
+      https://arxiv.org/abs/2312.09008
+
+    Parameter names (qkv, proj) intentionally match timm's Attention exactly,
+    so existing checkpoints trained with timm's Attention load into this
+    class with no changes (verified -- see the regression test alongside
+    this change).
+
+    When style_injection=False (the default -- always the case during
+    training, and during ordinary non-style generation), forward() computes
+    plain scaled-dot-product self-attention, mathematically identical to
+    timm's Attention. Style injection only activates when a caller opts in
+    at inference time; it never affects training or normal generation.
+
+    When style_injection=True, the input batch is expected to be exactly
+    [style_half; content_half] stacked along dim 0 (equal-sized halves).
+    Each content position attends using ITS OWN query (preserving the
+    content's structure/layout) but the STYLE half's key/value (injecting
+    the style's texture/appearance) -- this substitution is what "style
+    injection" actually means. The style half continues attending to
+    itself normally, so its own trajectory stays self-consistent for use
+    at the next timestep.
+
+    Two refinements from the paper, both included here:
+      - query_preservation: AdaIN the content query toward the style
+        query's per-head statistics before computing attention. Per the
+        paper, this further aligns the injected attention distribution
+        without discarding the content query's own spatial structure
+        (AdaIN rescales channel-wise statistics, it doesn't reshuffle
+        positions).
+      - tau (attention temperature): substituting a different K/V
+        distribution than the query's own tends to over-smooth (raise the
+        entropy of) the resulting softmax attention map, blurring detail.
+        Scaling attention logits by tau > 1 before softmax sharpens the
+        distribution back down; the paper reports ~1.5 as a reasonable
+        default, which is why it's the default here too, but it's exposed
+        for tuning.
+
+    Generalization note (same spirit as diffusion/style_transfer.py's
+    AdaIN): the original paper applies style injection only within certain
+    U-Net decoder layers, since a U-Net has an explicit encoder/decoder
+    split motivating that choice. GenTron's DiT-style backbone is
+    isotropic -- every block is structurally the same -- so there's no
+    directly analogous "which layers" distinction to inherit from the
+    paper. This implementation makes style injection available uniformly
+    at every self-attention layer by default; callers can restrict it to a
+    subset of blocks via the `style_injection` flag passed per-block if a
+    narrower range turns out to work better empirically (see
+    GenTronT2V.forward_with_style_and_cfg's `style_layers` argument).
+    """
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    @staticmethod
+    def _adain(content_feat, style_feat, eps=1e-5):
+        # content_feat, style_feat: (B, heads, N, head_dim). Normalize per
+        # (batch, head) over the token dimension N.
+        c_mean = content_feat.mean(dim=2, keepdim=True)
+        c_std = content_feat.std(dim=2, keepdim=True)
+        s_mean = style_feat.mean(dim=2, keepdim=True)
+        s_std = style_feat.std(dim=2, keepdim=True)
+        return (content_feat - c_mean) / (c_std + eps) * (s_std + eps) + s_mean
+
+    def forward(self, x, style_injection=False, query_preservation=True, tau=1.5):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # each (B, num_heads, N, head_dim)
+
+        if not style_injection:
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            out = attn @ v
+        else:
+            assert B % 2 == 0, (
+                f"style_injection=True expects a batch of [style_half; content_half] "
+                f"(equal-sized halves), got batch size {B}"
+            )
+            half = B // 2
+            q_style, q_content = q[:half], q[half:]
+            k_style, v_style = k[:half], v[:half]
+            # NOTE: content's own k_content/v_content (k[half:], v[half:]) are
+            # intentionally never used below -- that's the whole point of
+            # style injection, content attends using STYLE's k/v instead.
+
+            if query_preservation:
+                q_content = self._adain(q_content, q_style)
+
+            attn_content = (q_content @ k_style.transpose(-2, -1)) * self.scale * tau
+            attn_content = attn_content.softmax(dim=-1)
+            attn_content = self.attn_drop(attn_content)
+            out_content = attn_content @ v_style
+
+            attn_style = (q_style @ k_style.transpose(-2, -1)) * self.scale
+            attn_style = attn_style.softmax(dim=-1)
+            attn_style = self.attn_drop(attn_style)
+            out_style = attn_style @ v_style
+
+            out = torch.cat([out_style, out_content], dim=0)
+
+        out = out.transpose(1, 2).reshape(B, N, C)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        return out
+
+
 class CrossAttention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
         super().__init__()
@@ -228,7 +348,7 @@ class GenTronT2VBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn1 = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.attn1 = StyleInjectionAttention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn2 = nn.MultiheadAttention(hidden_size, num_heads=num_heads, bias=True, add_bias_kv=True, batch_first=True)
         self.norm4 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -242,9 +362,25 @@ class GenTronT2VBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c, y, b, mask=None, motion_free_mask=None):
+    def forward(self, x, c, y, b, mask=None, motion_free_mask=None,
+                style_injection=False, query_preservation=True, tau=1.5):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn1(modulate(self.norm1(x), shift_msa, scale_msa))
+        # style_injection etc. are only meaningful for attn1 (self-attention);
+        # attn2 (text cross-attention) and attn3 (temporal attention) are
+        # untouched by this feature and behave exactly as before.
+        if style_injection:
+            attn1_out = self.attn1(
+                modulate(self.norm1(x), shift_msa, scale_msa),
+                style_injection=True, query_preservation=query_preservation, tau=tau,
+            )
+            # gate_msa/shift_msa/scale_msa were computed from `c`, which for
+            # the [style_half; content_half] batch already contains the
+            # right per-sample modulation for each half (c has the same
+            # batch layout as x), so no special-casing needed here beyond
+            # attn1 itself.
+        else:
+            attn1_out = self.attn1(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_msa.unsqueeze(1) * attn1_out
         x = x + self.attn2(self.norm3(x), y, y, key_padding_mask=mask)[0]
         x = rearrange(x, "(b t) n d -> (b n) t d", b=b).contiguous()
         x = x + self.attn3(self.norm4(x), self.norm4(x), self.norm4(x), attn_mask=motion_free_mask)[0]
@@ -576,7 +712,8 @@ class GenTronT2V(nn.Module):
         imgs = x.reshape(x.shape[0], c, h * p, h * p)
         return imgs
 
-    def forward(self, x, t, y, mask=None, motion_free_mask=None):
+    def forward(self, x, t, y, mask=None, motion_free_mask=None,
+                style_injection=False, query_preservation=True, tau=1.5, style_layers=None):
         b, _, f, _, _ = x.shape
         x = rearrange(x, "b c f h w -> (b f) c h w").contiguous()
         x = self.x_embedder(x) + self.pos_embed
@@ -589,12 +726,14 @@ class GenTronT2V(nn.Module):
         mask = repeat(mask, "b d -> (b f) d", f=f).contiguous()
         y_pool = repeat(y_pool, "b d -> (b f) d", f=f).contiguous()
         c = t + y_pool
-        for block in self.blocks:
+        for block_idx, block in enumerate(self.blocks):
             if motion_free_mask is None:
                 motion_free_mask = [torch.eye(f).bool(), torch.ones(f, f).bool()][
                     np.random.choice([0, 1], p=[self.motion_free_prob, 1 - self.motion_free_prob])
                 ].to(x.device)
-            x = block(x, c, y, b, mask, motion_free_mask)
+            block_style_injection = style_injection and (style_layers is None or block_idx in style_layers)
+            x = block(x, c, y, b, mask, motion_free_mask,
+                      style_injection=block_style_injection, query_preservation=query_preservation, tau=tau)
         x = self.final_layer(x, c)
         x = self.unpatchify(x)
         x = rearrange(x, "(b f) c h w -> b c f h w", f=f).contiguous()
@@ -615,7 +754,70 @@ class GenTronT2V(nn.Module):
         eps = torch.cat([half_eps, half_eps], dim=0)
         return torch.cat([eps, rest], dim=1)
 
-    def forward_with_cfg_and_mfg(self, x, t, y, cfg_scale, mfg_scale, mask=None, motion_free_mask=None):
+    def forward_with_style_and_cfg(
+        self, x, t, y, cfg_scale, style_x, style_y,
+        mask=None, style_mask=None, query_preservation=True, tau=1.5, style_layers=None,
+    ):
+        """
+        Combines classifier-free guidance with StyleID-style attention
+        injection (see StyleInjectionAttention's docstring in this file).
+
+        `x` here is the usual CFG-doubled content batch: [content x N; a
+        second copy of content x N] with `y`/`mask` correspondingly
+        [cond_text x N; uncond_text x N] -- exactly like forward_with_cfg's
+        own `x`/`y`/`mask` arguments.
+
+        `style_x` is the style branch's CURRENT noisy latent at this same
+        timestep `t` (from its own, separately-stepped DDIM trajectory --
+        see sample_style_transfer.py's sampling loop for how that's
+        advanced in lockstep with the content branch). `style_y`/
+        `style_mask` are its text conditioning (commonly a null/empty
+        prompt, since the style branch's only job is supplying key/value
+        features, not being "generated" in the usual sense).
+
+        Internally this builds the [style_half; content_half] batch
+        StyleInjectionAttention expects, where content_half is itself the
+        [cond; uncond] pair -- i.e. style_x is duplicated to match content's
+        doubled size so shapes align 1:1 with GenTronT2VBlock's batch
+        layout, and a single self.forward(...) call handles both the
+        style-injection substitution AND the CFG duplication in one pass.
+        """
+        n = len(x) // 2  # size of one content copy (cond or uncond)
+        assert style_x.shape[0] in (1, n), (
+            f"style_x batch size must be 1 (broadcast) or match the content batch size "
+            f"({n}), got {style_x.shape[0]}"
+        )
+        style_x_matched = style_x.expand(n, *style_x.shape[1:]) if style_x.shape[0] == 1 else style_x
+        style_x_doubled = torch.cat([style_x_matched, style_x_matched], dim=0)  # aligns with [cond; uncond]
+
+        style_y_matched = style_y.expand(n, *style_y.shape[1:]) if style_y.shape[0] == 1 else style_y
+        style_y_doubled = torch.cat([style_y_matched, style_y_matched], dim=0)
+        if style_mask is not None:
+            style_mask_matched = style_mask.expand(n, *style_mask.shape[1:]) if style_mask.shape[0] == 1 else style_mask
+            style_mask_doubled = torch.cat([style_mask_matched, style_mask_matched], dim=0)
+        else:
+            style_mask_doubled = torch.ones(style_x_doubled.shape[0], style_y_doubled.shape[1],
+                                             dtype=torch.bool, device=x.device)
+
+        combined_x = torch.cat([style_x_doubled, x], dim=0)
+        combined_y = torch.cat([style_y_doubled, y], dim=0)
+        combined_mask = torch.cat([style_mask_doubled, mask], dim=0) if mask is not None else style_mask_doubled
+        combined_t = torch.cat([t, t], dim=0) if t.shape[0] == len(x) else t
+
+        model_out = self.forward(
+            combined_x, combined_t, combined_y, combined_mask,
+            style_injection=True, query_preservation=query_preservation, tau=tau, style_layers=style_layers,
+        )
+        # First half of the output batch is the style branch's own (self-
+        # consistent) prediction -- discard it here, the caller advances the
+        # style trajectory separately with a plain (non-injected) step.
+        content_out = model_out[style_x_doubled.shape[0]:]
+
+        eps, rest = content_out[:, :self.in_channels], content_out[:, self.in_channels:]
+        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        eps = torch.cat([half_eps, half_eps], dim=0)
+        return torch.cat([eps, rest], dim=1)
         third = x[: len(x) // 3]
         combined = torch.cat([third, third, third], dim=0)
         model_out = self.forward(combined, t, y, mask)

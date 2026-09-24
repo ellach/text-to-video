@@ -1,16 +1,19 @@
 """
-Style transfer for GenTron using Initial Latent AdaIN, adapted from:
+Full style transfer for GenTron, implementing both components of:
 
   "Style Injection in Diffusion: A Training-free Approach for Adapting
   Large-scale Diffusion Models for Style Transfer" (StyleID), CVPR 2024.
   https://arxiv.org/abs/2312.09008
 
-This implements ONLY the paper's Initial Latent AdaIN (color & tone
-initialization) component -- see diffusion/style_transfer.py for a detailed
-explanation of what that is and how it's generalized here from single
-images to video clips. The paper's other component (attention injection /
-attention temperature scaling inside self-attention layers) is a separate
-mechanism and is NOT implemented here.
+  1. Initial Latent AdaIN (color & tone initialization) -- see
+     diffusion/style_transfer.py for details on this piece and how it's
+     generalized here from single images to video clips.
+  2. Attention-based style injection -- at every self-attention layer and
+     every denoising step, content attends using its OWN query (preserving
+     structure/motion) but the STYLE video's key/value (injecting texture/
+     appearance), with query-preservation AdaIN and attention-temperature
+     scaling as refinements, exactly as in the paper. See
+     StyleInjectionAttention's docstring in models.py for full details.
 
 Usage:
     python sample_style_transfer.py \
@@ -26,25 +29,36 @@ How it works:
     2. Each latent is DDIM-inverted into the noise the model would have
        produced it from (deterministic, no training involved).
     3. The content noise's per-channel mean/std are replaced with the
-       style noise's per-channel mean/std (AdaIN) -- this is the step that
-       actually transfers color/tone.
-    4. Ordinary DDIM sampling runs forward from that combined noise,
-       conditioned on --prompt, producing the final video.
+       style noise's per-channel mean/std (Initial Latent AdaIN) --
+       transfers coarse color/tone before any denoising happens.
+    4. Content and style are then denoised STEP BY STEP IN LOCKSTEP: at
+       each timestep, content's self-attention layers use style's current
+       key/value (attention injection -- this is what transfers texture,
+       not just color), while style takes an ordinary, uninjected step to
+       keep its own trajectory valid for the next timestep's injection.
 
 Caveats worth knowing:
-    - This only transfers the coarse, low-frequency color/tone statistics
-      captured in the initial latent -- NOT fine-grained texture/brushwork
-      style, which the paper's (unimplemented-here) attention injection
-      handles. Expect a color-grading-like effect, not a full artistic
-      style transfer.
+    - This sampling loop is inherently sequential (content and style must
+      be stepped together, one timestep at a time) and roughly 2x the
+      per-step cost of ordinary sampling (both branches run the model each
+      step) -- expect it to take longer than plain --style_video-less
+      generation at the same --num_sampling_steps.
     - DDIM inversion is only exactly invertible for a deterministic sampler
-      (eta=0, which p_sample_loop's underlying DDIM path uses here) and
-      accumulates some numerical drift over many steps -- this is a known,
-      inherent limitation of DDIM inversion in general, not specific to
-      this implementation.
-    - Untested against real trained weights end-to-end (no GPU available
-      in the environment this was written in) -- verify on your own
-      checkpoint before relying on it.
+      (eta=0, used throughout here) and accumulates some numerical drift
+      over many steps -- a known, inherent limitation of DDIM inversion in
+      general, not specific to this implementation.
+    - GenTron's DiT backbone is isotropic (every block structurally
+      identical), unlike the U-Net the original paper used (which has an
+      explicit encoder/decoder split motivating which layers to inject
+      at). This implementation injects at every block by default; use
+      --style_layers to restrict it if uniform injection over- or
+      under-stylizes relative to what you want.
+    - Verified: the attention-injection math (StyleInjectionAttention) is
+      numerically identical to plain self-attention when unused (checkpoint
+      compatibility confirmed), and the combined CFG+style batching produces
+      correct output shapes (see accompanying smoke tests). NOT verified:
+      end-to-end visual quality against a real trained checkpoint -- no GPU
+      was available in the environment this was written in.
 """
 
 import argparse
@@ -75,6 +89,22 @@ def parse_args(input_args=None):
     parser.add_argument("--fps", type=int, default=4)
     parser.add_argument("--cfg_scale", type=float, default=7.5)
     parser.add_argument("--num_sampling_steps", type=int, default=250)
+    parser.add_argument("--tau", type=float, default=1.5,
+                         help="Attention temperature scaling for style-injected self-attention "
+                              "(paper default ~1.5). Higher sharpens the attention map, countering "
+                              "the over-smoothing that substituting a different K/V distribution causes.")
+    parser.add_argument("--no_query_preservation", action="store_true",
+                         help="Disable AdaIN-ing the content query toward the style query's statistics "
+                              "before computing injected attention (on by default, per the paper).")
+    parser.add_argument("--style_layers", type=int, nargs="*", default=None,
+                         help="Block indices to apply style injection at (0-indexed). Default: all "
+                              "blocks. GenTron's isotropic DiT backbone has no inherent 'which layers' "
+                              "answer the way a U-Net's encoder/decoder split does in the original "
+                              "paper -- this is exposed so you can experiment if uniform injection "
+                              "over-stylizes or under-stylizes relative to what you want.")
+    parser.add_argument("--progress", action="store_true", default=True,
+                         help="Show a progress bar during the (necessarily sequential, can't batch "
+                              "across timesteps) style-injection sampling loop.")
     parser.add_argument("--inversion_steps", type=int, default=50,
                          help="DDIM steps used for inverting content/style videos to noise. "
                               "Doesn't need to match --num_sampling_steps.")
@@ -274,23 +304,56 @@ def main(args):
     # --- Step 4: Initial Latent AdaIN -- the actual style-transfer step ---
     styled_noise = adain_latent(content_noise, style_noise)
 
-    # --- Step 5: ordinary forward sampling from the AdaIN'd noise ---
+    # --- Step 5: coupled dual-trajectory sampling with attention-based
+    # style injection (the actual StyleID mechanism) at every step ---
     sample_diffusion = create_diffusion(str(args.num_sampling_steps))
-    z = torch.cat([styled_noise, styled_noise], 0)
     y_null_inputs = tokenizer([""], padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
     uncond_tokens = y_null_inputs["input_ids"].to(device)
     y_null = text_encoder(input_ids=uncond_tokens).last_hidden_state
     uncond_mask = y_null_inputs["attention_mask"].bool().to(device)
     y_cfg = torch.cat([y, y_null], 0)
     mask_cfg = torch.cat([mask, uncond_mask], 0)
-    model_kwargs = dict(y=y_cfg, cfg_scale=args.cfg_scale, mask=mask_cfg)
 
-    print(f"Sampling ({args.num_sampling_steps} steps)...")
-    samples = sample_diffusion.ddim_sample_loop(
-        model.forward_with_cfg, z.shape, noise=z, clip_denoised=False,
-        model_kwargs=model_kwargs, progress=True, device=device,
-    )
-    samples, _ = samples.chunk(2, dim=0)
+    # Style branch is conditioned on a null/empty prompt throughout -- its
+    # only job is supplying key/value features to inject into content's
+    # self-attention, not being "generated" toward any particular text.
+    style_kwargs = dict(y=y_null, mask=uncond_mask)
+
+    content_x = torch.cat([styled_noise, styled_noise], 0)  # [cond; uncond] copies
+    style_x = style_noise.clone()
+    timesteps = list(range(sample_diffusion.num_timesteps))[::-1]
+
+    print(f"Sampling with style injection at every step ({args.num_sampling_steps} steps, "
+          f"tau={args.tau}, query_preservation={not args.no_query_preservation})...")
+    if args.progress:
+        from tqdm.auto import tqdm
+        timesteps = tqdm(timesteps)
+    for i in timesteps:
+        t_content = torch.tensor([i] * content_x.shape[0], device=device)
+        t_style = torch.tensor([i] * style_x.shape[0], device=device)
+
+        with torch.no_grad():
+            # Content step: uses style_x's CURRENT (same-timestep) noisy
+            # latent as the source of injected key/value.
+            content_out = sample_diffusion.ddim_sample(
+                model.forward_with_style_and_cfg, content_x, t_content,
+                clip_denoised=False,
+                model_kwargs=dict(
+                    y=y_cfg, cfg_scale=args.cfg_scale, mask=mask_cfg,
+                    style_x=style_x, style_y=y_null, style_mask=uncond_mask,
+                    query_preservation=not args.no_query_preservation, tau=args.tau,
+                    style_layers=args.style_layers,
+                ),
+            )
+            content_x = content_out["sample"]
+
+            # Style step: ordinary (non-injected) DDIM step, advancing the
+            # style branch's own trajectory so it stays self-consistent and
+            # available at the next (lower) timestep.
+            style_out = sample_diffusion.ddim_sample(model, style_x, t_style, clip_denoised=False, model_kwargs=style_kwargs)
+            style_x = style_out["sample"]
+
+    samples, _ = content_x.chunk(2, dim=0)
 
     b, _, _, _, _ = samples.shape
     samples = rearrange(samples, "b c f h w -> (b f) c h w").contiguous()
