@@ -72,6 +72,9 @@ def parse_args(input_args=None):
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument("--ckpt_every", type=int, default=50_000)
+    parser.add_argument("--resume", type=str, default=None,
+                         help="Path to a checkpoint .pt file to resume training from "
+                              "(restores model, EMA, optimizer state, and train step count).")
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -120,6 +123,20 @@ def main(args=None):
     
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
+    resume_train_steps = 0
+    if args.resume is not None:
+        if accelerator.is_main_process:
+            print(f"Resuming from checkpoint: {args.resume}")
+        resume_checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(resume_checkpoint["model"])
+        ema.load_state_dict(resume_checkpoint["ema"])
+        opt.load_state_dict(resume_checkpoint["opt"])
+        # Checkpoints don't store the step count directly; it's encoded in the
+        # filename (e.g. "0007000.pt" -> step 7000), which is the only record of it.
+        resume_train_steps = int(os.path.splitext(os.path.basename(args.resume))[0])
+        if accelerator.is_main_process:
+            print(f"Resumed at train_steps={resume_train_steps}")
+
     dataset_cls = WebVid if args.dataset == "webvid" else MSRVTT
     dataset = dataset_cls(
         meta_path=args.meta_path,
@@ -143,12 +160,13 @@ def main(args=None):
     if accelerator.is_main_process:
         logger.info(f"Dataset contains {len(dataset):,} videos ({args.data_dir})")
 
-    update_ema(ema, model, decay=0)
+    if args.resume is None:
+        update_ema(ema, model, decay=0)
     model.train()
     ema.eval()
     model, opt, loader = accelerator.prepare(model, opt, loader)
 
-    train_steps = 0
+    train_steps = resume_train_steps
     log_steps = 0
     running_loss = 0
     start_time = time()
