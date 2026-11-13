@@ -9,3 +9,5 @@ __pycache__/
 msrvtt_data/
 MSRVTT/
 Webvid/
+models/
+*.safetensors
