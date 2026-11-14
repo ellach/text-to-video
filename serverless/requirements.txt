@@ -1,0 +1,16 @@
+runpod
+torch
+diffusers
+transformers
+accelerate
+safetensors
+sentencepiece
+ftfy
+imageio
+imageio-ffmpeg
+opencv-python-headless
+pillow
+numpy
+requests
+boto3
+huggingface_hub

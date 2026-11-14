@@ -1,0 +1,187 @@
+"""
+RunPod serverless worker: text description (+ optional logo) -> video (Wan 2.2 TI2V-5B) with the logo placed automatically.
+
+Input (job["input"]):
+  prompt       str   required   what the video shows (max 1000 characters)
+  logo_url     str   optional   https URL of the logo image (png/jpg/webp, max 10 MB). No logo -> plain video.
+  aspect       str   "9:16" (default, vertical) or "16:9"
+  duration_s   float seconds, 1..5 (default 5)
+  quality      str   "fast" (480p, default) or "high" (704x1280)
+  logo_target  str   optional   force a surface, e.g. "t-shirt" (default: chosen automatically)
+  seed         int   optional
+
+Output: {"video_url": ..., "logo": "surface:<name>" | "corner watermark" | "none", "seed": ..., "seconds": ...}
+        or {"error": "..."}.
+Storage: set S3_BUCKET (+ S3_ENDPOINT_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_REGION) to get a presigned URL.
+         Without S3_BUCKET the video is returned as base64 ("video_base64"): fine for tests, too big for production.
+Model:   MODEL_DIR (default /runpod-volume/models/Wan2.2-TI2V-5B-Diffusers); if it does not exist the model is downloaded
+         from Hugging Face on the first job.
+"""
+import base64
+import ipaddress
+import os
+import socket
+import tempfile
+import time
+import uuid
+from urllib.parse import urlparse
+
+import numpy as np
+
+MODEL_DIR = os.environ.get("MODEL_DIR", "/runpod-volume/models/Wan2.2-TI2V-5B-Diffusers")
+HF_ID = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+MAX_PROMPT = 1000
+MAX_LOGO_BYTES = 10 * 1024 * 1024
+FPS = 24
+SIZES = {("fast", "16:9"): (480, 832), ("fast", "9:16"): (832, 480),
+         ("high", "16:9"): (704, 1280), ("high", "9:16"): (1280, 704)}      # (height, width)
+NEGATIVE = ("blurry, low quality, distorted, deformed, extra fingers, static, still image, worst quality, "
+            "jpeg artifacts, subtitles, watermark")
+
+_pipe = None
+_segmenter = None
+
+
+class JobError(Exception):
+    pass
+
+
+def get_pipe():
+    global _pipe
+    if _pipe is None:
+        import generate_wan as G
+        _pipe = G.load_pipeline(MODEL_DIR if os.path.isdir(MODEL_DIR) else HF_ID)
+    return _pipe
+
+
+def get_segmenter():
+    global _segmenter
+    if _segmenter is None:
+        import add_logo as A
+        _segmenter = A.ClipSegSegmenter()
+    return _segmenter
+
+
+def check_url(url):
+    """https only, and never a private/internal address (the URL comes from a user)."""
+    u = urlparse(url)
+    if u.scheme != "https" or not u.hostname:
+        raise JobError("logo_url must be an https URL")
+    try:
+        for info in socket.getaddrinfo(u.hostname, 443):
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                raise JobError("logo_url points to a non-public address")
+    except socket.gaierror:
+        raise JobError("logo_url host not found")
+
+
+def download_logo(url, dest_dir):
+    import requests
+    check_url(url)
+    r = requests.get(url, stream=True, timeout=20, allow_redirects=False)
+    if r.status_code != 200:
+        raise JobError(f"logo_url returned HTTP {r.status_code}")
+    path = os.path.join(dest_dir, "logo")
+    n = 0
+    with open(path, "wb") as f:
+        for chunk in r.iter_content(65536):
+            n += len(chunk)
+            if n > MAX_LOGO_BYTES:
+                raise JobError("logo file is larger than 10 MB")
+            f.write(chunk)
+    from PIL import Image
+    try:
+        im = Image.open(path)
+        im.verify()
+        fmt = (im.format or "").lower()
+    except Exception:
+        raise JobError("logo_url is not a valid image")
+    if fmt not in ("png", "jpeg", "webp"):
+        raise JobError("logo must be png, jpg or webp")
+    final = path + "." + ("jpg" if fmt == "jpeg" else fmt)
+    os.rename(path, final)
+    return final
+
+
+def frames_for(duration_s):
+    n = int(round(duration_s * FPS))
+    k = max(1, min(30, int(round((n - 1) / 4))))   # Wan needs 4k+1 frames: take the nearest valid count (5 .. 121)
+    return 4 * k + 1
+
+
+def parse(inp):
+    if not isinstance(inp, dict):
+        raise JobError("input must be an object")
+    prompt = str(inp.get("prompt", "")).strip()
+    if not prompt:
+        raise JobError("prompt is required")
+    if len(prompt) > MAX_PROMPT:
+        raise JobError(f"prompt is longer than {MAX_PROMPT} characters")
+    aspect = inp.get("aspect") or "9:16"
+    quality = inp.get("quality") or "fast"
+    if (quality, aspect) not in SIZES:
+        raise JobError('aspect must be "9:16" or "16:9" and quality "fast" or "high"')
+    try:
+        duration = float(inp.get("duration_s", 5))
+    except (TypeError, ValueError):
+        raise JobError("duration_s must be a number")
+    if not 1 <= duration <= 5:
+        raise JobError("duration_s must be between 1 and 5")
+    seed = inp.get("seed")
+    seed = int(seed) if seed is not None else int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
+    return dict(prompt=prompt, aspect=aspect, quality=quality, duration=duration, seed=seed,
+                logo_url=inp.get("logo_url") or None, logo_target=inp.get("logo_target") or None)
+
+
+def store(path, upload=None):
+    if upload:
+        return {"video_url": upload(path)}
+    bucket = os.environ.get("S3_BUCKET")
+    if not bucket:
+        with open(path, "rb") as f:
+            return {"video_base64": base64.b64encode(f.read()).decode()}
+    import boto3
+    s3 = boto3.client("s3", endpoint_url=os.environ.get("S3_ENDPOINT_URL"), region_name=os.environ.get("S3_REGION"))
+    key = f"videos/{uuid.uuid4().hex}.mp4"
+    s3.upload_file(path, bucket, key, ExtraArgs={"ContentType": "video/mp4"})
+    return {"video_url": s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=7 * 86400)}
+
+
+def run(inp, upload=None):
+    t0 = time.time()
+    p = parse(inp)
+    import add_logo as A
+    with tempfile.TemporaryDirectory() as tmp:
+        logo = download_logo(p["logo_url"], tmp) if p["logo_url"] else None
+        import torch
+        h, w = SIZES[(p["quality"], p["aspect"])]
+        out = get_pipe()(prompt=p["prompt"], negative_prompt=NEGATIVE, height=h, width=w,
+                         num_frames=frames_for(p["duration"]), num_inference_steps=30, guidance_scale=5.0,
+                         generator=torch.Generator("cpu").manual_seed(p["seed"])).frames[0]
+        import generate_wan as G
+        frames = G.to_uint8_frames(out)
+        report = "none"
+        if logo:
+            frames, rep = A.add_logo(frames, logo, get_segmenter(), p["logo_target"], False, p["seed"], None)
+            report = ("surface:" + str(rep["surface"])) if rep["mode"] == "surface" else "corner watermark"
+        path = os.path.join(tmp, "out.mp4")
+        A.write_video(frames, FPS, path)
+        res = store(path, upload)
+    res.update(logo=report, seed=p["seed"], seconds=round(time.time() - t0, 1))
+    return res
+
+
+def handler(job):
+    try:
+        return run(job.get("input"))
+    except JobError as e:
+        return {"error": str(e)}
+    except Exception as e:                                   # never leak internals to the app user
+        print("job failed:", repr(e))
+        return {"error": "generation failed"}
+
+
+if __name__ == "__main__":
+    import runpod
+    runpod.serverless.start({"handler": handler})

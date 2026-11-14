@@ -1,0 +1,9 @@
+{
+  "input": {
+    "prompt": "a woman in a white t-shirt waving at the camera in a sunny kitchen, steady camera",
+    "logo_url": "https://example.com/logo.png",
+    "aspect": "9:16",
+    "duration_s": 3,
+    "quality": "fast"
+  }
+}
