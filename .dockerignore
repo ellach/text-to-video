@@ -1,0 +1,6 @@
+models/
+wan2_2/
+.git/
+*.mp4
+*.pt
+__pycache__/
