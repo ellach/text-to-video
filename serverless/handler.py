@@ -179,7 +179,7 @@ def handler(job):
         return {"error": str(e)}
     except Exception as e:                                   # never leak internals to the app user
         print("job failed:", repr(e))
-        return {"error": "generation failed"}
+        return {"error": "generation failed: " + repr(e)[:300] if os.environ.get("DEBUG_ERRORS") else "generation failed"}
 
 
 if __name__ == "__main__":
