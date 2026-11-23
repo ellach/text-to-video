@@ -9,6 +9,9 @@ Input (job["input"]):
   quality      str   "fast" (480p, default) or "high" (704x1280)
   logo_target  str   optional   force a surface, e.g. "t-shirt" (default: chosen automatically)
   seed         int   optional
+  type         str   "video" (default) or "image"
+                     image: prompt, optional logo_url/logo_target/seed, aspect "1:1" (default), "9:16" or "16:9"
+                     (Stable Diffusion XL, about 1 megapixel). Output has "image_url" (or "image_base64") instead of "video_url".
 
 Output: {"video_url": ..., "logo": "surface:<name>" | "corner watermark" | "none", "seed": ..., "seconds": ...}
         or {"error": "..."}.
@@ -35,10 +38,14 @@ MAX_LOGO_BYTES = 10 * 1024 * 1024
 FPS = 24
 SIZES = {("fast", "16:9"): (480, 832), ("fast", "9:16"): (832, 480),
          ("high", "16:9"): (704, 1280), ("high", "9:16"): (1280, 704)}      # (height, width)
+IMG_SIZES = {"1:1": (1024, 1024), "9:16": (1344, 768), "16:9": (768, 1344)}      # (height, width), SDXL-friendly sizes
+IMG_MODEL = os.environ.get("IMAGE_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
+IMG_NEGATIVE = "blurry, low quality, distorted, deformed, extra fingers, bad anatomy, watermark, text, jpeg artifacts"
 NEGATIVE = ("blurry, low quality, distorted, deformed, extra fingers, static, still image, worst quality, "
             "jpeg artifacts, subtitles, watermark")
 
 _pipe = None
+_img_pipe = None
 _segmenter = None
 
 
@@ -52,6 +59,14 @@ def get_pipe():
         import generate_wan as G
         _pipe = G.load_pipeline(MODEL_DIR if os.path.isdir(MODEL_DIR) else HF_ID)
     return _pipe
+
+
+def get_image_pipe():
+    global _img_pipe
+    if _img_pipe is None:
+        import generate_image as GI
+        _img_pipe = GI.load_pipeline(IMG_MODEL)
+    return _img_pipe
 
 
 def get_segmenter():
@@ -118,6 +133,17 @@ def parse(inp):
         raise JobError("prompt is required")
     if len(prompt) > MAX_PROMPT:
         raise JobError(f"prompt is longer than {MAX_PROMPT} characters")
+    kind = inp.get("type") or "video"
+    if kind not in ("video", "image"):
+        raise JobError('type must be "video" or "image"')
+    seed = inp.get("seed")
+    seed = int(seed) if seed is not None else int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
+    if kind == "image":
+        aspect = inp.get("aspect") or "1:1"
+        if aspect not in IMG_SIZES:
+            raise JobError('aspect must be "1:1", "9:16" or "16:9" for images')
+        return dict(type="image", prompt=prompt, aspect=aspect, seed=seed,
+                    logo_url=inp.get("logo_url") or None, logo_target=inp.get("logo_target") or None)
     aspect = inp.get("aspect") or "9:16"
     quality = inp.get("quality") or "fast"
     if (quality, aspect) not in SIZES:
@@ -128,29 +154,30 @@ def parse(inp):
         raise JobError("duration_s must be a number")
     if not 1 <= duration <= 5:
         raise JobError("duration_s must be between 1 and 5")
-    seed = inp.get("seed")
-    seed = int(seed) if seed is not None else int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
-    return dict(prompt=prompt, aspect=aspect, quality=quality, duration=duration, seed=seed,
+    return dict(type="video", prompt=prompt, aspect=aspect, quality=quality, duration=duration, seed=seed,
                 logo_url=inp.get("logo_url") or None, logo_target=inp.get("logo_target") or None)
 
 
-def store(path, upload=None):
+def store(path, upload=None, kind="video"):
     if upload:
-        return {"video_url": upload(path)}
+        return {kind + "_url": upload(path)}
     bucket = os.environ.get("S3_BUCKET")
     if not bucket:
         with open(path, "rb") as f:
-            return {"video_base64": base64.b64encode(f.read()).decode()}
+            return {kind + "_base64": base64.b64encode(f.read()).decode()}
     import boto3
     s3 = boto3.client("s3", endpoint_url=os.environ.get("S3_ENDPOINT_URL"), region_name=os.environ.get("S3_REGION"))
-    key = f"videos/{uuid.uuid4().hex}.mp4"
-    s3.upload_file(path, bucket, key, ExtraArgs={"ContentType": "video/mp4"})
-    return {"video_url": s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=7 * 86400)}
+    ext, ctype = ("png", "image/png") if kind == "image" else ("mp4", "video/mp4")
+    key = f"{kind}s/{uuid.uuid4().hex}.{ext}"
+    s3.upload_file(path, bucket, key, ExtraArgs={"ContentType": ctype})
+    return {kind + "_url": s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=7 * 86400)}
 
 
 def run(inp, upload=None):
     t0 = time.time()
     p = parse(inp)
+    if p["type"] == "image":
+        return run_image(p, upload)
     import add_logo as A
     with tempfile.TemporaryDirectory() as tmp:
         logo = download_logo(p["logo_url"], tmp) if p["logo_url"] else None
@@ -170,6 +197,30 @@ def run(inp, upload=None):
         res = store(path, upload)
     res.update(logo=report, seed=p["seed"], seconds=round(time.time() - t0, 1))
     return res
+
+
+def run_image(p, upload=None):
+    t0 = time.time()
+    import add_logo as A
+    from PIL import Image
+    with tempfile.TemporaryDirectory() as tmp:
+        logo = download_logo(p["logo_url"], tmp) if p["logo_url"] else None
+        import torch
+        h, w = IMG_SIZES[p["aspect"]]
+        img = get_image_pipe()(prompt=p["prompt"], negative_prompt=IMG_NEGATIVE, height=h, width=w,
+                               num_inference_steps=30, guidance_scale=6.5,
+                               generator=torch.Generator("cpu").manual_seed(p["seed"])).images[0]
+        frame = np.array(img.convert("RGB"))
+        report = "none"
+        if logo:
+            res, rep = A.add_logo([frame], logo, get_segmenter(), p["logo_target"], False, p["seed"], None)
+            frame = res[0]
+            report = ("surface:" + str(rep["surface"])) if rep["mode"] == "surface" else "corner watermark"
+        path = os.path.join(tmp, "out.png")
+        Image.fromarray(frame).save(path)
+        out = store(path, upload, "image")
+    out.update(logo=report, seed=p["seed"], seconds=round(time.time() - t0, 1))
+    return out
 
 
 def handler(job):

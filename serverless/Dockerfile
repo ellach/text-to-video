@@ -4,7 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libgl1 l
 WORKDIR /app
 COPY serverless/requirements.txt .
 RUN pip install --no-cache-dir -U -r requirements.txt
-COPY generate_wan.py add_logo.py ./
+COPY generate_wan.py generate_image.py add_logo.py ./
 COPY logoblend ./logoblend
 COPY serverless/handler.py .
 # Weights are NOT in the image (tens of GB). Mount a network volume with the model, or the first job downloads it.
