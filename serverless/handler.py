@@ -211,6 +211,16 @@ def store(path, upload=None, kind="video"):
     return {kind + "_url": s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=7 * 86400)}
 
 
+def place_logo(frames, logo, p):
+    """logo_target "corner" -> small watermark in the bottom-right corner (no object search); else automatic."""
+    import add_logo as A
+    if p["logo_target"] == "corner":
+        rgb, alpha = A.load_logo(logo, False)
+        return A.apply_watermark(frames, rgb, alpha, 0.16), "corner watermark"
+    frames, rep = A.add_logo(frames, logo, get_segmenter(), p["logo_target"], False, p["seed"], None)
+    return frames, (("surface:" + str(rep["surface"])) if rep["mode"] == "surface" else "corner watermark")
+
+
 def run(inp, upload=None):
     t0 = time.time()
     p = parse(inp)
@@ -235,8 +245,7 @@ def run(inp, upload=None):
         frames = G.to_uint8_frames(out)
         report = "none"
         if logo:
-            frames, rep = A.add_logo(frames, logo, get_segmenter(), p["logo_target"], False, p["seed"], None)
-            report = ("surface:" + str(rep["surface"])) if rep["mode"] == "surface" else "corner watermark"
+            frames, report = place_logo(frames, logo, p)
         path = os.path.join(tmp, "out.mp4")
         A.write_video(frames, fps, path)
         res = store(path, upload)
@@ -263,9 +272,8 @@ def run_image(p, upload=None):
         frame = np.array(img.convert("RGB"))
         report = "none"
         if logo:
-            res, rep = A.add_logo([frame], logo, get_segmenter(), p["logo_target"], False, p["seed"], None)
+            res, report = place_logo([frame], logo, p)
             frame = res[0]
-            report = ("surface:" + str(rep["surface"])) if rep["mode"] == "surface" else "corner watermark"
         path = os.path.join(tmp, "out.png")
         Image.fromarray(frame).save(path)
         out = store(path, upload, "image")
