@@ -6,7 +6,7 @@ Input (job["input"]):
   logo_url     str   optional   https URL of the logo image (png/jpg/webp, max 10 MB). No logo -> plain video.
   aspect       str   "9:16" (default, vertical) or "16:9"
   duration_s   float seconds, 1..5 (default 5)
-  quality      str   "fast" (480p, default) or "high" (704x1280)
+  quality      str   "fast" (480p), "high" (704x1280, Wan 2.2 5B) or "pro" (720p, Wan 2.2 14B: best people/motion, needs an 80 GB GPU)
   logo_target  str   optional   force a surface, e.g. "t-shirt" (default: chosen automatically)
   seed         int   optional
   type         str   "video" (default) or "image"
@@ -33,11 +33,13 @@ import numpy as np
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/runpod-volume/models/Wan2.2-TI2V-5B-Diffusers")
 HF_ID = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+HF_ID_PRO = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"      # two 14B experts (~56 GB in bf16): needs an 80 GB GPU
 MAX_PROMPT = 1000
 MAX_LOGO_BYTES = 10 * 1024 * 1024
 FPS = 24
 SIZES = {("fast", "16:9"): (480, 832), ("fast", "9:16"): (832, 480),
-         ("high", "16:9"): (704, 1280), ("high", "9:16"): (1280, 704)}      # (height, width)
+         ("high", "16:9"): (704, 1280), ("high", "9:16"): (1280, 704),
+         ("pro", "16:9"): (720, 1280), ("pro", "9:16"): (1280, 720)}      # (height, width)
 IMG_SIZES = {"1:1": (1024, 1024), "9:16": (1344, 768), "16:9": (768, 1344)}      # (height, width), SDXL-friendly sizes
 IMG_MODEL = os.environ.get("IMAGE_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
 IMG_NEGATIVE = "blurry, low quality, distorted, deformed, extra fingers, bad anatomy, watermark, text, jpeg artifacts"
@@ -45,6 +47,7 @@ NEGATIVE = ("blurry, low quality, distorted, deformed, extra fingers, static, st
             "jpeg artifacts, subtitles, watermark")
 
 _pipe = None
+_pro_pipe = None
 _img_pipe = None
 _segmenter = None
 
@@ -54,11 +57,33 @@ class JobError(Exception):
 
 
 def get_pipe():
-    global _pipe
+    global _pipe, _pro_pipe
     if _pipe is None:
+        if _pro_pipe is not None:
+            import gc
+            import torch
+            _pro_pipe = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         import generate_wan as G
         _pipe = G.load_pipeline(MODEL_DIR if os.path.isdir(MODEL_DIR) else HF_ID)
     return _pipe
+
+
+def get_pro_pipe():
+    """Wan 2.2 14B. Only one big video model lives in memory at a time."""
+    global _pipe, _pro_pipe
+    if _pro_pipe is None:
+        import gc
+        import torch
+        _pipe = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        import generate_wan as G
+        _pro_pipe = G.load_pipeline(HF_ID_PRO)
+    return _pro_pipe
 
 
 def get_image_pipe():
@@ -119,8 +144,12 @@ def download_logo(url, dest_dir):
     return final
 
 
-def frames_for(duration_s):
-    n = int(round(duration_s * FPS))
+def fps_for(quality):
+    return 16 if quality == "pro" else FPS      # Wan 2.2 14B is trained at 16 fps
+
+
+def frames_for(duration_s, fps=None):
+    n = int(round(duration_s * (fps or FPS)))
     k = max(1, min(30, int(round((n - 1) / 4))))   # Wan needs 4k+1 frames: take the nearest valid count (5 .. 121)
     return 4 * k + 1
 
@@ -147,7 +176,7 @@ def parse(inp):
     aspect = inp.get("aspect") or "9:16"
     quality = inp.get("quality") or "fast"
     if (quality, aspect) not in SIZES:
-        raise JobError('aspect must be "9:16" or "16:9" and quality "fast" or "high"')
+        raise JobError('aspect must be "9:16" or "16:9" and quality "fast", "high" or "pro"')
     try:
         duration = float(inp.get("duration_s", 5))
     except (TypeError, ValueError):
@@ -183,9 +212,16 @@ def run(inp, upload=None):
         logo = download_logo(p["logo_url"], tmp) if p["logo_url"] else None
         import torch
         h, w = SIZES[(p["quality"], p["aspect"])]
-        out = get_pipe()(prompt=p["prompt"], negative_prompt=NEGATIVE, height=h, width=w,
-                         num_frames=frames_for(p["duration"]), num_inference_steps=30, guidance_scale=5.0,
-                         generator=torch.Generator("cpu").manual_seed(p["seed"])).frames[0]
+        fps = fps_for(p["quality"])
+        gen = torch.Generator("cpu").manual_seed(p["seed"])
+        if p["quality"] == "pro":
+            out = get_pro_pipe()(prompt=p["prompt"], negative_prompt=NEGATIVE, height=h, width=w,
+                                 num_frames=frames_for(p["duration"], fps), num_inference_steps=40,
+                                 guidance_scale=4.0, guidance_scale_2=3.0, generator=gen).frames[0]
+        else:
+            out = get_pipe()(prompt=p["prompt"], negative_prompt=NEGATIVE, height=h, width=w,
+                             num_frames=frames_for(p["duration"]), num_inference_steps=30, guidance_scale=5.0,
+                             generator=gen).frames[0]
         import generate_wan as G
         frames = G.to_uint8_frames(out)
         report = "none"
@@ -193,7 +229,7 @@ def run(inp, upload=None):
             frames, rep = A.add_logo(frames, logo, get_segmenter(), p["logo_target"], False, p["seed"], None)
             report = ("surface:" + str(rep["surface"])) if rep["mode"] == "surface" else "corner watermark"
         path = os.path.join(tmp, "out.mp4")
-        A.write_video(frames, FPS, path)
+        A.write_video(frames, fps, path)
         res = store(path, upload)
     res.update(logo=report, seed=p["seed"], seconds=round(time.time() - t0, 1))
     return res
