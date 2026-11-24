@@ -1,4 +1,5 @@
 # torch comes from the base image (2.5.1 + CUDA 12.4): do NOT upgrade it here.
+runpod
 diffusers==0.35.1
 transformers==4.55.4
 peft==0.17.1
