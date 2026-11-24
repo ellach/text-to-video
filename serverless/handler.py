@@ -182,6 +182,8 @@ def parse(inp):
                     logo_url=inp.get("logo_url") or None, logo_target=inp.get("logo_target") or None)
     aspect = inp.get("aspect") or "9:16"
     quality = inp.get("quality") or "fast"
+    if quality == "pro" and os.environ.get("ENABLE_PRO") != "1":
+        raise JobError('quality "pro" is switched off; use "high"')
     if (quality, aspect) not in SIZES:
         raise JobError('aspect must be "9:16" or "16:9" and quality "fast", "high" or "pro"')
     try:
@@ -271,6 +273,22 @@ def run_image(p, upload=None):
     return out
 
 
+def free_volume_space():
+    """Delete the unused Wan 14B download (about 100 GB) and Hugging Face's temporary download cache, so the
+    volume has room for the models we use. Runs once when a worker starts. Set ENABLE_PRO=1 to keep the 14B."""
+    import shutil
+    if os.environ.get("ENABLE_PRO") == "1":
+        return
+    hf = os.environ.get("HF_HOME", "/runpod-volume/hf")
+    for d in (os.path.join(hf, "hub", "models--" + HF_ID_PRO.replace("/", "--")), os.path.join(hf, "xet")):
+        try:
+            if os.path.isdir(d):
+                print("freeing space: removing", d)
+                shutil.rmtree(d, ignore_errors=True)
+        except Exception as e:
+            print("cleanup skipped:", repr(e))
+
+
 def handler(job):
     try:
         return run(job.get("input"))
@@ -283,4 +301,5 @@ def handler(job):
 
 if __name__ == "__main__":
     import runpod
+    free_volume_space()
     runpod.serverless.start({"handler": handler})
