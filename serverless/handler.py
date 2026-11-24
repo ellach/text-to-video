@@ -41,7 +41,7 @@ SIZES = {("fast", "16:9"): (480, 832), ("fast", "9:16"): (832, 480),
          ("high", "16:9"): (704, 1280), ("high", "9:16"): (1280, 704),
          ("pro", "16:9"): (720, 1280), ("pro", "9:16"): (1280, 720)}      # (height, width)
 IMG_SIZES = {"1:1": (1024, 1024), "9:16": (1344, 768), "16:9": (768, 1344)}      # (height, width), SDXL-friendly sizes
-IMG_MODEL = os.environ.get("IMAGE_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
+IMG_MODEL = os.environ.get("IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")      # Apache-2.0, follows prompts with several people well
 IMG_NEGATIVE = "blurry, low quality, distorted, deformed, extra fingers, bad anatomy, watermark, text, jpeg artifacts"
 NEGATIVE = ("blurry, low quality, distorted, deformed, extra fingers, static, still image, worst quality, "
             "jpeg artifacts, subtitles, watermark")
@@ -89,8 +89,15 @@ def get_pro_pipe():
 def get_image_pipe():
     global _img_pipe
     if _img_pipe is None:
-        import generate_image as GI
-        _img_pipe = GI.load_pipeline(IMG_MODEL)
+        if "flux" in IMG_MODEL.lower():
+            import torch
+            from diffusers import FluxPipeline
+            _img_pipe = FluxPipeline.from_pretrained(IMG_MODEL, torch_dtype=torch.bfloat16)
+            if torch.cuda.is_available():
+                _img_pipe.enable_model_cpu_offload()
+        else:
+            import generate_image as GI
+            _img_pipe = GI.load_pipeline(IMG_MODEL)
     return _img_pipe
 
 
@@ -243,9 +250,14 @@ def run_image(p, upload=None):
         logo = download_logo(p["logo_url"], tmp) if p["logo_url"] else None
         import torch
         h, w = IMG_SIZES[p["aspect"]]
-        img = get_image_pipe()(prompt=p["prompt"], negative_prompt=IMG_NEGATIVE, height=h, width=w,
-                               num_inference_steps=30, guidance_scale=6.5,
-                               generator=torch.Generator("cpu").manual_seed(p["seed"])).images[0]
+        gen = torch.Generator("cpu").manual_seed(p["seed"])
+        if "flux" in IMG_MODEL.lower():
+            # FLUX.1-schnell: 4 steps, no guidance and no negative prompt (it is distilled)
+            img = get_image_pipe()(prompt=p["prompt"], height=h, width=w, num_inference_steps=4,
+                                   guidance_scale=0.0, max_sequence_length=256, generator=gen).images[0]
+        else:
+            img = get_image_pipe()(prompt=p["prompt"], negative_prompt=IMG_NEGATIVE, height=h, width=w,
+                                   num_inference_steps=30, guidance_scale=6.5, generator=gen).images[0]
         frame = np.array(img.convert("RGB"))
         report = "none"
         if logo:
