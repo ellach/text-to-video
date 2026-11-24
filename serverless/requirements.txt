@@ -1,8 +1,9 @@
-runpod
-torch
-diffusers
-transformers
-accelerate
+# torch comes from the base image (2.5.1 + CUDA 12.4): do NOT upgrade it here.
+diffusers==0.35.1
+transformers==4.55.4
+peft==0.17.1
+accelerate==1.10.1
+huggingface_hub>=0.34,<1.0
 safetensors
 sentencepiece
 ftfy
@@ -10,7 +11,6 @@ imageio
 imageio-ffmpeg
 opencv-python-headless
 pillow
-numpy
+numpy<2.3
 requests
 boto3
-huggingface_hub
