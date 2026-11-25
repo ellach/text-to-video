@@ -86,6 +86,26 @@ def get_pro_pipe():
     return _pro_pipe
 
 
+IMG_LORA = os.environ.get("IMG_LORA", "hugovntr/flux-schnell-realism")   # Apache-2.0 photo-realism LoRA for FLUX.1-schnell; "" = off
+
+
+def load_realism_lora(pipe):
+    """Make FLUX images look like real photos. Never breaks image generation: on any problem it logs and goes on without."""
+    if not IMG_LORA:
+        return
+    try:
+        weight = os.environ.get("IMG_LORA_WEIGHT")
+        if not weight:
+            from huggingface_hub import list_repo_files
+            files = sorted(f for f in list_repo_files(IMG_LORA) if f.endswith(".safetensors"))
+            weight = files[-1] if files else None
+        pipe.load_lora_weights(IMG_LORA, weight_name=weight, adapter_name="realism")
+        pipe.set_adapters(["realism"], adapter_weights=[float(os.environ.get("IMG_LORA_SCALE", "1.0"))])
+        print(f"[image] realism LoRA loaded: {IMG_LORA} / {weight}", flush=True)
+    except Exception as e:
+        print(f"[image] realism LoRA NOT loaded ({e!r}); continuing without it", flush=True)
+
+
 def get_image_pipe():
     global _img_pipe
     if _img_pipe is None:
@@ -93,6 +113,7 @@ def get_image_pipe():
             import torch
             from diffusers import FluxPipeline
             _img_pipe = FluxPipeline.from_pretrained(IMG_MODEL, torch_dtype=torch.bfloat16)
+            load_realism_lora(_img_pipe)
             if torch.cuda.is_available():
                 _img_pipe.enable_model_cpu_offload()
         else:
