@@ -43,7 +43,7 @@ MIN_PRESENCE = 0.5    # ... in at least half of the frames
 AREA_CAP = 0.4        # larger surfaces do not score higher
 MAX_SURFACE_AREA = 0.6   # a 'surface' covering most of the frame is the background, not a shirt or a poster
 MAX_LOGO_FRAC = 0.3      # the logo is never wider than this fraction of the video width
-BODY_PROMPTS = ["a person's face", "a person's hand"]     # kept off the garment mask so the logo lands on cloth
+BODY_PROMPTS = ["a person's face", "a person's hand", "a person's bare skin, neck or chest"]     # kept off the garment mask so the logo lands on cloth
 APPAREL_WORDS = ("clothes", "person", "shirt", "tee", "hoodie", "jacket", "sweater", "dress", "jersey", "polo", "blouse")
 
 
@@ -442,6 +442,39 @@ def apply_logo_natural(frames, small, rgb, alpha, masks, anchor, size, fold=0.6,
     return out
 
 
+def place_on_garment_still(frame, rgb, alpha, cloth_small, size=0.45, max_frac=MAX_LOGO_FRAC):
+    """A still image: print the logo on the garment like it came with it. It goes at the most 'inside' point of the
+    cloth (so never on the neckline, straps or skin), sized to the width of the cloth there, and takes the fabric's
+    lighting, creases and grain (composite_natural)."""
+    H, W = frame.shape[:2]
+    hs, ws = cloth_small.shape
+    m = cv2.resize(cloth_small.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if n <= 1:
+        return None
+    m = (lab == 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))).astype(np.uint8)
+    dist = cv2.distanceTransform(m, cv2.DIST_L2, 5)
+    # prefer the upper-middle of the cloth: bias the interior point toward the chest, away from the hem
+    ys, xs = np.where(m > 0)
+    top, bot = ys.min(), ys.max()
+    yy = np.arange(H)[:, None]
+    bias = 1.0 - 0.35 * np.clip((yy - (top + 0.30 * (bot - top))) / max(0.7 * (bot - top), 1), 0, 1)
+    cy, cx = np.unravel_index(np.argmax(dist * bias), dist.shape)
+    half = float(dist[cy, cx])                                   # radius of the biggest circle of cloth
+    lw = min(size * 2 * half * 1.25, max_frac * W)
+    lw = max(lw, 24)
+    r, a = resize_logo(rgb, alpha, lw)
+    lh, lwi = r.shape[:2]
+    x0, y0 = int(round(cx - lwi / 2)), int(round(cy - lh / 2))
+    layer = np.zeros((H, W, 4), np.float32)
+    X0, Y0, X1, Y1 = max(x0, 0), max(y0, 0), min(x0 + lwi, W), min(y0 + lh, H)
+    layer[Y0:Y1, X0:X1, :3] = r[Y0 - y0:Y1 - y0, X0 - x0:X1 - x0]
+    layer[Y0:Y1, X0:X1, 3] = a[Y0 - y0:Y1 - y0, X0 - x0:X1 - x0]
+    layer[..., 3] *= m.astype(np.float32)                        # never spill off the garment
+    return composite_natural(frame, layer, m.astype(bool), 0)
+
+
 def apply_watermark(frames, rgb, alpha, size):
     H, W = frames[0].shape[:2]
     r, a = resize_logo(rgb, alpha, size * W)
@@ -472,7 +505,9 @@ def add_logo(frames, logo_path, segmenter, target=None, randomize=False, seed=0,
         anchors = {n: CANDIDATES[n][1] for n in names}
 
     probs = segmenter(small, prompts + BODY_PROMPTS)               # [P + 2, T, h, w]
-    body = (probs[len(prompts)] > THRESH) | (probs[len(prompts) + 1] > THRESH)
+    body = probs[len(prompts)] > THRESH
+    for j in range(1, len(BODY_PROMPTS)):
+        body = body | (probs[len(prompts) + j] > THRESH)
     masks = {n: probs[i] > THRESH for i, n in enumerate(names)}
     rng = np.random.default_rng(seed)
     if target == "clothes":
@@ -492,6 +527,10 @@ def add_logo(frames, logo_path, segmenter, target=None, randomize=False, seed=0,
     if is_apparel(pick):                                           # on clothes: not on the face or hands, on the chest
         surface_mask = remove_body(surface_mask, body)
         anchor = (0.5, 0.38)
+        if len(frames) == 1:                                       # still image: print it on the cloth, fabric-aware
+            res = place_on_garment_still(frames[0], rgb, alpha, surface_mask[0], size or 0.45, max_logo_frac)
+            if res is not None:
+                return [res], report
     if natural and len(frames) > 1:
         return apply_logo_natural(frames, small, rgb, alpha, surface_mask, anchor, size or 0.4, fold, max_logo_frac, blender), report
     return apply_logo_box(frames, rgb, alpha, surface_mask, anchor, size or 0.4, max_logo_frac), report
