@@ -44,7 +44,7 @@ AREA_CAP = 0.4        # larger surfaces do not score higher
 MAX_SURFACE_AREA = 0.6   # a 'surface' covering most of the frame is the background, not a shirt or a poster
 MAX_LOGO_FRAC = 0.3      # the logo is never wider than this fraction of the video width
 BODY_PROMPTS = ["a person's face", "a person's hand"]     # kept off the garment mask so the logo lands on cloth
-APPAREL_WORDS = ("shirt", "tee", "hoodie", "jacket", "sweater", "dress", "jersey", "polo", "blouse")
+APPAREL_WORDS = ("clothes", "person", "shirt", "tee", "hoodie", "jacket", "sweater", "dress", "jersey", "polo", "blouse")
 
 
 # ------------------------------------------------------------------ video io
@@ -126,11 +126,11 @@ class ClipSegSegmenter:
 
 
 # ------------------------------------------------------------------ scoring and tracking
-def score_surface(masks):
+def score_surface(masks, min_area=None):
     """masks: bool [T, H, W] -> (score, presence, mean_area, stability)"""
     T = masks.shape[0]
     area = masks.reshape(T, -1).mean(1)
-    present = area >= MIN_AREA
+    present = area >= (MIN_AREA if min_area is None else min_area)
     presence = float(present.mean())
     if presence == 0:
         return 0.0, 0.0, 0.0, 0.0
@@ -458,7 +458,11 @@ def add_logo(frames, logo_path, segmenter, target=None, randomize=False, seed=0,
     s = WORK_SIDE / max(H, W)
     small = [cv2.resize(f, (max(int(W * s), 8), max(int(H * s), 8)), interpolation=cv2.INTER_AREA) for f in frames]
 
-    if target:
+    if target == "clothes":                                         # "on clothing, whatever it is": clothes first, else the person's chest
+        names = ["clothes", "person"]
+        prompts = ["a person's clothing: shirt, top, jacket or dress", "a person"]
+        anchors = {"clothes": (0.5, 0.38), "person": (0.5, 0.33)}
+    elif target:
         names, prompts, anchors = [target], [target], {target: (0.5, 0.45)}
         if target in CANDIDATES:
             prompts, anchors = [CANDIDATES[target][0]], {target: CANDIDATES[target][1]}
@@ -470,10 +474,14 @@ def add_logo(frames, logo_path, segmenter, target=None, randomize=False, seed=0,
     probs = segmenter(small, prompts + BODY_PROMPTS)               # [P + 2, T, h, w]
     body = (probs[len(prompts)] > THRESH) | (probs[len(prompts) + 1] > THRESH)
     masks = {n: probs[i] > THRESH for i, n in enumerate(names)}
-    scores = {n: score_surface(masks[n]) for n in names}
     rng = np.random.default_rng(seed)
-    pick = choose_surface(scores, rng, randomize) if not target else (
-        target if scores[target][1] >= MIN_PRESENCE else None)
+    if target == "clothes":
+        scores = {n: score_surface(masks[n], 0.004) for n in names}
+        pick = next((n for n in names if scores[n][1] >= 0.3), None)
+    else:
+        scores = {n: score_surface(masks[n]) for n in names}
+        pick = choose_surface(scores, rng, randomize) if not target else (
+            target if scores[target][1] >= MIN_PRESENCE else None)
 
     report = {"scores": scores, "surface": pick}
     if pick is None:
