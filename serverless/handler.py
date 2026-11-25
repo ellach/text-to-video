@@ -302,6 +302,60 @@ def run_image(p, upload=None):
     return out
 
 
+# ---- Background removal for the Ad maker (task "cutout") --------------------------------------------------------
+# Input:  {"task": "cutout", "image_base64": "<jpeg/png>"}   Output: {"image_base64": "<png with transparent background>"}
+# Model:  BiRefNet (MIT licence). Runs in about a second on the GPU.
+CUT_MODEL = os.environ.get("CUT_MODEL", "ZhengPeng7/BiRefNet")
+_cutter = None
+
+
+def get_cutter():
+    global _cutter
+    if _cutter is None:
+        import torch
+        from transformers import AutoModelForImageSegmentation
+        m = AutoModelForImageSegmentation.from_pretrained(CUT_MODEL, trust_remote_code=True, low_cpu_mem_usage=False)
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        m = m.to(dev).eval()
+        if dev == "cuda":
+            m = m.half()
+        _cutter = (m, dev)
+    return _cutter
+
+
+def run_cutout(inp):
+    t0 = time.time()
+    import io
+    import torch
+    from PIL import Image
+    raw = inp.get("image_base64") or ""
+    if "," in raw[:80]:
+        raw = raw.split(",", 1)[1]                      # accept a data URL too
+    data = base64.b64decode(raw, validate=False)
+    if not 1000 < len(data) < 12 * 1024 * 1024:
+        raise JobError("image is missing or too large")
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    if max(img.size) > 2048:
+        img.thumbnail((2048, 2048))
+    model, dev = get_cutter()
+    small = np.asarray(img.resize((1024, 1024), Image.BILINEAR), dtype=np.float32) / 255.0
+    small = (small - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    x = torch.from_numpy(small.transpose(2, 0, 1)).unsqueeze(0).to(dev)
+    if dev == "cuda":
+        x = x.half()
+    with torch.no_grad():
+        pred = model(x)[-1].sigmoid().float().cpu()[0, 0].numpy()
+    mask = Image.fromarray((np.clip(pred, 0, 1) * 255).astype(np.uint8)).resize(img.size, Image.LANCZOS)
+    img.putalpha(mask)
+    box = mask.point(lambda v: 255 if v > 24 else 0).getbbox()   # crop away the empty border
+    if box:
+        img = img.crop(box)
+    buf = io.BytesIO()
+    img.save(buf, "PNG", optimize=False)
+    return {"image_base64": base64.b64encode(buf.getvalue()).decode(), "width": img.width, "height": img.height,
+            "seconds": round(time.time() - t0, 1)}
+
+
 def free_volume_space():
     """Delete the unused Wan 14B download (about 100 GB) and Hugging Face's temporary download cache, so the
     volume has room for the models we use. Runs once when a worker starts. Set ENABLE_PRO=1 to keep the 14B."""
@@ -319,8 +373,17 @@ def free_volume_space():
 
 
 def handler(job):
+    inp = job.get("input")
+    if isinstance(inp, dict) and inp.get("task") == "cutout":
+        try:
+            return run_cutout(inp)
+        except JobError as e:
+            return {"error": str(e)}
+        except Exception as e:
+            print("cutout failed:", repr(e), flush=True)
+            return {"error": "cutout failed: " + repr(e)[:300]}
     try:
-        return run(job.get("input"))
+        return run(inp)
     except JobError as e:
         return {"error": str(e)}
     except Exception as e:                                   # never leak internals to the app user

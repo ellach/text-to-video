@@ -16,3 +16,6 @@ pillow
 numpy<2.3
 requests
 boto3
+timm
+einops
+kornia
