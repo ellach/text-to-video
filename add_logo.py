@@ -28,7 +28,7 @@ from PIL import Image
 
 # surface name -> (CLIPSeg prompt, where on the surface the logo goes: (x, y) as a fraction of the surface box)
 CANDIDATES = {
-    "t-shirt":   ("a t-shirt",   (0.5, 0.38)),
+    "t-shirt":   ("a shirt, t-shirt or jacket", (0.5, 0.38)),
     "poster":    ("a poster",    (0.5, 0.5)),
     "sign":      ("a sign",      (0.5, 0.5)),
     "billboard": ("a billboard", (0.5, 0.5)),
