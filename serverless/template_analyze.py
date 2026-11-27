@@ -140,7 +140,7 @@ def read_text(rgb):
         xs = [p[0] for p in poly]
         ys = [p[1] for p in poly]
         boxes.append([max(0, min(xs)), max(0, min(ys)), min(W, max(xs)), min(H, max(ys))])
-    boxes = [b for b in boxes if b[2] - b[0] >= 6 and b[3] - b[1] >= 8]
+    boxes = [b for b in boxes if b[2] - b[0] >= 6 and b[3] - b[1] >= 8 and (b[3] - b[1]) <= 1.3 * (b[2] - b[0])]   # tall narrow boxes are sideways text on packaging
     # words on the same row -> one line
     boxes.sort(key=lambda b: b[0])
     rows = []
@@ -220,13 +220,14 @@ def detect(img):
     inputs = proc(images=img, text=prompt, return_tensors="pt").to(_dev())
     with torch.no_grad():
         out = model(**inputs)
-    res = proc.post_process_grounded_object_detection(out, inputs.input_ids, threshold=0.3, text_threshold=0.25, target_sizes=[img.size[::-1]])[0]
+    res = proc.post_process_grounded_object_detection(out, inputs.input_ids, threshold=0.2, text_threshold=0.2, target_sizes=[img.size[::-1]])[0]
     labels = res.get("text_labels") or res.get("labels") or []
     found = []
     for box, score, lab in zip(res["boxes"].cpu().numpy().tolist(), res["scores"].cpu().numpy().tolist(), labels):
         lab = str(lab).lower()
         kind = "person" if "person" in lab else "logo" if "logo" in lab else "product" if lab.strip() else None
-        if kind:
+        need = {"person": 0.35, "product": 0.3, "logo": 0.2}.get(kind)
+        if kind and float(score) >= need:
             found.append({"kind": kind, "box": box, "score": float(score)})
     # same class, overlapping: keep the best
     found.sort(key=lambda d: -d["score"])
@@ -309,22 +310,54 @@ def analyze(img):
         if o["kind"] == "person":
             person_mask = m
 
-    # ---- shapes and decorations from the automatic masks
-    shapes, decor = [], []
+    # ---- everything else SAM finds is sorted by what it looks like (never by copying a photo into the new ad):
+    #      flat colour + big   -> a shape (backing shape, banner, button): copied as a flat-coloured shape
+    #      tiny and simple     -> a decoration (confetti, sparkles, bokeh): copied as is
+    #      textured, mid-size  -> a photo / product slot: the user's own photo goes there
+    pbox = people[0]["box"] if people else None
+    pad = 0.05 * max(W, H)
+    pexp = [pbox[0] - pad, pbox[1] - pad, pbox[2] + pad, pbox[3] + pad] if pbox else None
+    shapes, decor, extra = [], [], []
     for m in auto_masks(img):
         area = float(m.sum())
         frac = area / (W * H)
-        if frac < 0.00008 or frac > 0.6:
+        if frac < 0.00006 or frac > 0.6:
             continue
         if (m & taken).sum() > 0.5 * area:
             continue
         ys, xs = np.where(m)
         box = [xs.min(), ys.min(), xs.max() + 1, ys.max() + 1]
+        if pexp is not None and inside_frac(box, pexp) > 0.5:
+            continue                                  # a piece of the person (hair, hand): not a decoration
         spread = float(np.mean(np.std(rgb[m].astype(np.float32), axis=0)))
         if spread < 16 and frac > 0.01:
             shapes.append({"mask": m, "box": box, "frac": frac})
-        elif frac < 0.02:
+        elif frac < 0.004 and spread < 45:
             decor.append({"mask": m, "box": box, "frac": frac})
+        elif 0.004 <= frac < 0.15 and spread >= 30:
+            extra.append({"box": box, "frac": frac})
+    # flat coloured areas that SAM merged with something else (e.g. a white shape behind a person)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    mu = cv2.blur(gray, (7, 7))
+    local_std = np.sqrt(np.maximum(0, cv2.blur(gray * gray, (7, 7)) - mu * mu))
+    row_bg = np.array([np.median(rgb[y:y + 8].reshape(-1, 3), axis=0) for y in range(0, H, 8)]) if H >= 8 else np.zeros((1, 3))
+    bg_img = np.repeat(row_bg, 8, axis=0)[:H][:, None, :]
+    far = np.linalg.norm(rgb.astype(np.float32) - bg_img, axis=2) > 60
+    flat = (local_std < 6) & far & ~taken
+    flat = cv2.morphologyEx(flat.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    pdil = cv2.dilate(person_mask.astype(np.uint8), np.ones((15, 15), np.uint8)) > 0 if person_mask is not None else False
+    joined = flat.astype(bool) | pdil   # flat pieces around a person belong together
+    n_cc, cc = cv2.connectedComponents(joined.astype(np.uint8))
+    for i in range(1, n_cc):
+        m = (cc == i) & flat.astype(bool)
+        frac = float(m.sum()) / (W * H)
+        if frac < 0.01:
+            continue
+        ys, xs = np.where(m)
+        box = [xs.min(), ys.min(), xs.max() + 1, ys.max() + 1]
+        if any(iou(box, sh["box"]) > 0.5 for sh in shapes):
+            continue
+        shapes.append({"mask": m, "box": box, "frac": frac})
     shapes.sort(key=lambda s: -s["frac"])
     shapes = shapes[:6]
     decor.sort(key=lambda d: -d["frac"])
@@ -349,6 +382,15 @@ def analyze(img):
             b = d["box"]
             layers.append({"type": "decor", "x": fx(b[0]), "y": fy(b[1]), "w": fx(b[2] - b[0]), "h": fy(b[3] - b[1]), "src": src, "kind": "decoration"})
             taken |= d["mask"]
+    # textured objects the detector missed become photo slots (a product on a shelf, a second photo)
+    extra.sort(key=lambda e: -e["frac"])
+    slots = []
+    for e in extra:
+        if all(iou(e["box"], q["box"]) < 0.3 and inside_frac(e["box"], q["box"]) < 0.6 for q in slots + prods):
+            slots.append(e)
+    for e in slots[:8]:
+        b = e["box"]
+        layers.append({"type": "product", "x": fx(b[0]), "y": fy(b[1]), "w": fx(b[2] - b[0]), "h": fy(b[3] - b[1])})
 
     # ---- background: the pixels nobody claimed, as a vertical gradient
     free = ~cv2.dilate(taken.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
