@@ -20,3 +20,4 @@ timm
 einops
 kornia
 easyocr
+pytesseract

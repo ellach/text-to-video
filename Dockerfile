@@ -1,6 +1,6 @@
 # RunPod GitHub build: use the default Dockerfile path
 FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libgl1 libglib2.0-0 tesseract-ocr tesseract-ocr-heb tesseract-ocr-eng && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY serverless/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

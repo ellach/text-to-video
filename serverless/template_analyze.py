@@ -36,7 +36,8 @@ def _dev():
 def get_ocr():
     if "ocr" not in _models:
         import easyocr
-        _models["ocr"] = easyocr.Reader(["en", "he"], gpu=_dev() == "cuda", verbose=False)
+        # EasyOCR has no Hebrew model, but its text DETECTOR works on any script; the words are read with Tesseract below.
+        _models["ocr"] = easyocr.Reader(["en"], gpu=_dev() == "cuda", verbose=False)
     return _models["ocr"]
 
 
@@ -113,20 +114,48 @@ def crop_png(rgb, mask, box, flat=False, max_side=384):
 
 
 # ------------------------------------------------------------------ 1. text
+def read_line_text(rgb, box):
+    """The words inside a box, with Tesseract (Hebrew + English). Empty if Tesseract is not installed or finds nothing."""
+    try:
+        import pytesseract
+        from PIL import Image
+        x0, y0, x1, y1 = [int(v) for v in box]
+        H, W = rgb.shape[:2]
+        pad = 4
+        crop = Image.fromarray(rgb[max(0, y0 - pad):min(H, y1 + pad), max(0, x0 - pad):min(W, x1 + pad)])
+        return pytesseract.image_to_string(crop, lang="heb+eng", config="--psm 7").strip()
+    except Exception as e:
+        print("tesseract unavailable:", repr(e)[:120], flush=True)
+        return ""
+
+
 def read_text(rgb):
-    """EasyOCR lines -> blocks (a block is lines of one paragraph). Boxes in pixels."""
+    """Text regions (EasyOCR detector, any language) -> lines (words on one row) -> blocks (lines of one paragraph). Boxes in pixels."""
     H, W = rgb.shape[:2]
-    lines = []
-    for pts, text, conf in get_ocr().readtext(rgb):
-        text = (text or "").strip()
-        if not text or conf < 0.2:
-            continue
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        x0, y0, x1, y1 = max(0, min(xs)), max(0, min(ys)), min(W, max(xs)), min(H, max(ys))
-        if x1 - x0 < 3 or y1 - y0 < 3:
-            continue
-        lines.append({"text": text, "box": [x0, y0, x1, y1]})
+    horizontal, free = get_ocr().detect(rgb, text_threshold=0.5, low_text=0.3, link_threshold=0.4, canvas_size=1280)
+    boxes = []
+    for x0, x1, y0, y1 in (horizontal[0] if horizontal else []):
+        boxes.append([max(0, x0), max(0, y0), min(W, x1), min(H, y1)])
+    for poly in (free[0] if free else []):
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        boxes.append([max(0, min(xs)), max(0, min(ys)), min(W, max(xs)), min(H, max(ys))])
+    boxes = [b for b in boxes if b[2] - b[0] >= 6 and b[3] - b[1] >= 8]
+    # words on the same row -> one line
+    boxes.sort(key=lambda b: b[0])
+    rows = []
+    for b in boxes:
+        h = b[3] - b[1]
+        for r in rows:
+            rh = r[3] - r[1]
+            vov = min(b[3], r[3]) - max(b[1], r[1])
+            gap = max(0, b[0] - r[2], r[0] - b[2])
+            if vov > 0.6 * min(h, rh) and 0.6 <= h / rh <= 1.6 and gap < 1.0 * max(h, rh):
+                r[0], r[1], r[2], r[3] = min(r[0], b[0]), min(r[1], b[1]), max(r[2], b[2]), max(r[3], b[3])
+                break
+        else:
+            rows.append(list(b))
+    lines = [{"text": read_line_text(rgb, r), "box": r} for r in rows]
     lines.sort(key=lambda l: (l["box"][1], l["box"][0]))
     blocks = []
     for ln in lines:
@@ -253,6 +282,8 @@ def analyze(img):
     blocks = [b for b in blocks if not any(inside_frac(b["box"], l["box"]) > 0.6 for l in logos)]
     # a "product" that is really a piece of text, or lies inside the person: drop
     people = [o for o in objs if o["kind"] == "person"]
+    # text printed on a photo or a product (labels, shirts) is part of that picture, not an editable line
+    blocks = [b for b in blocks if not any(inside_frac(b["box"], o["box"]) > 0.6 for o in people + [p for p in objs if p["kind"] == "product"])]
     prods = [o for o in objs if o["kind"] == "product" and not any(inside_frac(o["box"], p["box"]) > 0.6 for p in people)
              and not any(inside_frac(o["box"], b["box"]) > 0.5 for b in blocks)]
     people = sorted(people, key=lambda o: -((o["box"][2] - o["box"][0]) * (o["box"][3] - o["box"][1])))[:1]
