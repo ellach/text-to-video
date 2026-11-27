@@ -19,3 +19,4 @@ boto3
 timm
 einops
 kornia
+easyocr

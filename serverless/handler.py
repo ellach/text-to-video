@@ -356,6 +356,23 @@ def run_cutout(inp):
             "seconds": round(time.time() - t0, 1)}
 
 
+def run_analyze(inp):
+    """Task "analyze": read an ad template picture and return its layers (see template_analyze.py)."""
+    t0 = time.time()
+    import io
+    from PIL import Image
+    import template_analyze as TA
+    raw = inp.get("image_base64") or ""
+    if "," in raw[:80]:
+        raw = raw.split(",", 1)[1]
+    data = base64.b64decode(raw, validate=False)
+    if not 1000 < len(data) < 12 * 1024 * 1024:
+        raise JobError("image is missing or too large")
+    out = TA.analyze(Image.open(io.BytesIO(data)))
+    out["seconds"] = round(time.time() - t0, 1)
+    return out
+
+
 def free_volume_space():
     """Delete the unused Wan 14B download (about 100 GB) and Hugging Face's temporary download cache, so the
     volume has room for the models we use. Runs once when a worker starts. Set ENABLE_PRO=1 to keep the 14B."""
@@ -382,6 +399,14 @@ def handler(job):
         except Exception as e:
             print("cutout failed:", repr(e), flush=True)
             return {"error": "cutout failed: " + repr(e)[:300]}
+    if isinstance(inp, dict) and inp.get("task") == "analyze":
+        try:
+            return run_analyze(inp)
+        except JobError as e:
+            return {"error": str(e)}
+        except Exception as e:
+            print("analyze failed:", repr(e), flush=True)
+            return {"error": "analyze failed: " + repr(e)[:300]}
     try:
         return run(inp)
     except JobError as e:

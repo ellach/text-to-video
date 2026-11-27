@@ -6,7 +6,7 @@ COPY serverless/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY generate_wan.py generate_image.py add_logo.py ./
 COPY logoblend ./logoblend
-COPY serverless/handler.py .
+COPY serverless/handler.py serverless/template_analyze.py ./
 # Weights are NOT in the image (tens of GB). Mount a network volume with the model, or the first job downloads it.
 ENV MODEL_DIR=/runpod-volume/models/Wan2.2-TI2V-5B-Diffusers HF_HOME=/runpod-volume/hf
 CMD ["python", "-u", "handler.py"]
