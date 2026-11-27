@@ -23,6 +23,7 @@ Model:   MODEL_DIR (default /runpod-volume/models/Wan2.2-TI2V-5B-Diffusers); if 
 import base64
 import ipaddress
 import os
+import sys
 import socket
 import tempfile
 import time
@@ -373,6 +374,66 @@ def run_analyze(inp):
     return out
 
 
+def run_adedit(inp):
+    """Task "adedit": edit a template ad so it shows the user's photos (Qwen-Image-Edit-2511, in its own process).
+    Input: template_base64, optional person_base64 / product_base64.  Output: image_base64 (JPEG, same shape as the template)."""
+    t0 = time.time()
+    import io
+    import json
+    import subprocess
+    import tempfile
+    from PIL import Image
+
+    def pic(key):
+        raw = inp.get(key) or ""
+        if not raw:
+            return None
+        if "," in raw[:80]:
+            raw = raw.split(",", 1)[1]
+        data = base64.b64decode(raw, validate=False)
+        if not 1000 < len(data) < 8 * 1024 * 1024:
+            raise JobError(f"{key} is missing or too large")
+        return Image.open(io.BytesIO(data)).convert("RGB")
+
+    tpl, person, product = pic("template_base64"), pic("person_base64"), pic("product_base64")
+    if tpl is None:
+        raise JobError("template_base64 is required")
+    ratio = tpl.width / tpl.height
+    h = int(round((1024 * 1024 / ratio) ** 0.5 / 16) * 16)
+    w = int(round(h * ratio / 16) * 16)
+    images, k = [tpl], 1
+    parts = ["Picture 1 is an advertisement template. Create a new advertisement that copies picture 1 exactly: the same background colours and gradient, "
+             "the same shapes, confetti, sparkles and decorations, the same layout and composition. Make only these changes."]
+    if person is not None:
+        k += 1
+        images.append(person)
+        parts.append(f"Replace the person in picture 1 with the person from picture {k}, at the same size and place, in the same style as the original (cut out, with the same backing shape if there is one).")
+    if product is not None:
+        k += 1
+        images.append(product)
+        parts.append(f"Replace the products in picture 1 with the product from picture {k}, shown nicely in the same area.")
+    else:
+        parts.append("Remove the small products and leave clean background there.")
+    parts.append("Remove ALL text, numbers and logos from the advertisement and leave clean background where they were.")
+    with tempfile.TemporaryDirectory() as td:
+        paths = []
+        for i, im in enumerate(images):
+            pth = os.path.join(td, f"in{i}.jpg")
+            im.thumbnail((1280, 1280))
+            im.save(pth, "JPEG", quality=92)
+            paths.append(pth)
+        out_path = os.path.join(td, "out.jpg")
+        job = {"images": paths, "prompt": " ".join(parts), "width": w, "height": h, "steps": int(inp.get("steps") or 30), "seed": int(inp.get("seed") or 0), "out": out_path}
+        jp = os.path.join(td, "job.json")
+        json.dump(job, open(jp, "w"))
+        env = dict(os.environ, PYTHONPATH="/opt/edit-libs:" + os.environ.get("PYTHONPATH", ""))
+        r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "edit_runner.py"), jp], env=env, capture_output=True, text=True, timeout=1500)
+        if r.returncode != 0 or not os.path.exists(out_path):
+            raise JobError("the editor failed: " + (r.stderr or r.stdout or "no output")[-400:])
+        data = open(out_path, "rb").read()
+    return {"image_base64": base64.b64encode(data).decode(), "width": w, "height": h, "seconds": round(time.time() - t0, 1)}
+
+
 def free_volume_space():
     """Delete the unused Wan 14B download (about 100 GB) and Hugging Face's temporary download cache, so the
     volume has room for the models we use. Runs once when a worker starts. Set ENABLE_PRO=1 to keep the 14B."""
@@ -399,6 +460,14 @@ def handler(job):
         except Exception as e:
             print("cutout failed:", repr(e), flush=True)
             return {"error": "cutout failed: " + repr(e)[:300]}
+    if isinstance(inp, dict) and inp.get("task") == "adedit":
+        try:
+            return run_adedit(inp)
+        except JobError as e:
+            return {"error": str(e)}
+        except Exception as e:
+            print("adedit failed:", repr(e), flush=True)
+            return {"error": "adedit failed: " + repr(e)[:300]}
     if isinstance(inp, dict) and inp.get("task") == "analyze":
         try:
             return run_analyze(inp)
