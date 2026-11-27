@@ -283,8 +283,8 @@ def debug_picture(rgb, layers):
 
 
 def analyze(img):
-    import cv2
-    from PIL import Image
+    """Only what the models find, with no sorting rules: text boxes (OCR detector), the person, products and logos
+    (Grounding DINO), the person's exact outline (SAM) and the background colours (pixels no box covers)."""
     img = img.convert("RGB")
     if max(img.size) > MAX_SIDE:
         img.thumbnail((MAX_SIDE, MAX_SIDE))
@@ -295,138 +295,23 @@ def analyze(img):
 
     blocks = read_text(rgb)
     objs = detect(img)
-
-    # a logo box that holds text: that text is part of the logo, not an editable line
     logos = [o for o in objs if o["kind"] == "logo"]
-    blocks = [b for b in blocks if not any(inside_frac(b["box"], l["box"]) > 0.6 for l in logos)]
-    # a "product" that is really a piece of text, or lies inside the person: drop
-    people = [o for o in objs if o["kind"] == "person"]
-    # no logo found, but there is text in the bottom strip (a brand name): that is the logo place
-    fallback_logo = None
-    if not logos:
-        foot = [b for b in blocks if (b["box"][1] + b["box"][3]) / 2 > 0.84 * H]
-        if foot:
-            fx0 = min(b["box"][0] for b in foot); fy0 = min(b["box"][1] for b in foot)
-            fx1 = max(b["box"][2] for b in foot); fy1 = max(b["box"][3] for b in foot)
-            pdx, pdy = 0.02 * W, 0.015 * H
-            fallback_logo = [max(0, fx0 - pdx), max(0, fy0 - pdy), min(W, fx1 + pdx), min(H, fy1 + pdy)]
-            blocks = [b for b in blocks if b not in foot]
-    # text printed on a photo or a product (labels, shirts) is part of that picture, not an editable line
-    blocks = [b for b in blocks if not any(inside_frac(b["box"], o["box"]) > 0.6 for o in people + [p for p in objs if p["kind"] == "product"])]
-    prods = [o for o in objs if o["kind"] == "product" and not any(inside_frac(o["box"], p["box"]) > 0.6 for p in people)
-             and not any(inside_frac(o["box"], b["box"]) > 0.5 for b in blocks)]
-    people = sorted(people, key=lambda o: -((o["box"][2] - o["box"][0]) * (o["box"][3] - o["box"][1])))[:1]
-    prods = [o for o in prods if (o["box"][2] - o["box"][0]) * (o["box"][3] - o["box"][1]) < 0.35 * W * H]
+    blocks = [b for b in blocks if not any(inside_frac(b["box"], l["box"]) > 0.6 for l in logos)]   # words inside a logo are the logo
+    people = sorted([o for o in objs if o["kind"] == "person"], key=lambda o: -((o["box"][2] - o["box"][0]) * (o["box"][3] - o["box"][1])))[:1]
+    prods = [o for o in objs if o["kind"] == "product"]
 
-    known = people + prods + logos
-    kmasks = sam_masks_for_boxes(rgb, [o["box"] for o in known]) if known else []
     layers = []
-    taken = np.zeros((H, W), bool)       # pixels explained by text / photos / logos
+    covered = np.zeros((H, W), bool)
     for b in blocks:
         x0, y0, x1, y1 = [int(v) for v in b["box"]]
-        taken[max(0, y0 - 2):y1 + 2, max(0, x0 - 2):x1 + 2] = True
-    person_mask = None
-    for o, m in zip(known, kmasks):
-        taken |= m
-        ys, xs = np.where(m)
-        if not len(xs):
-            continue
-        bx0, by0, bx1, by1 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
-        o["mask"] = m
-        o["tight"] = [bx0, by0, bx1, by1]
-        o["fill"] = float(m.sum()) / max(1.0, (bx1 - bx0) * (by1 - by0))
-        if o["kind"] == "person":
-            person_mask = m
+        covered[max(0, y0 - 2):y1 + 2, max(0, x0 - 2):x1 + 2] = True
+    for o in people + prods + logos:
+        x0, y0, x1, y1 = [int(v) for v in o["box"]]
+        covered[max(0, y0):y1, max(0, x0):x1] = True
 
-    # ---- everything else SAM finds is sorted by what it looks like (never by copying a photo into the new ad):
-    #      flat colour + big   -> a shape (backing shape, banner, button): copied as a flat-coloured shape
-    #      tiny and simple     -> a decoration (confetti, sparkles, bokeh): copied as is
-    #      textured, mid-size  -> a photo / product slot: the user's own photo goes there
-    pbox = people[0]["box"] if people else None
-    pad = 0.05 * max(W, H)
-    pexp = [pbox[0] - pad, pbox[1] - pad, pbox[2] + pad, pbox[3] + pad] if pbox else None
-    shapes, decor, extra = [], [], []
-    for m in auto_masks(img):
-        area = float(m.sum())
-        frac = area / (W * H)
-        if frac < 0.00006 or frac > 0.6:
-            continue
-        if (m & taken).sum() > 0.5 * area:
-            continue
-        ys, xs = np.where(m)
-        box = [xs.min(), ys.min(), xs.max() + 1, ys.max() + 1]
-        if pexp is not None and inside_frac(box, pexp) > 0.5:
-            continue                                  # a piece of the person (hair, hand): not a decoration
-        spread = float(np.mean(np.std(rgb[m].astype(np.float32), axis=0)))
-        if spread < 16 and frac > 0.01:
-            shapes.append({"mask": m, "box": box, "frac": frac})
-        elif frac < 0.004 and spread < 28 and float(rgb[m].mean()) > 140:
-            decor.append({"mask": m, "box": box, "frac": frac})
-        elif 0.004 <= frac < 0.15 and spread >= 30:
-            extra.append({"box": box, "frac": frac})
-    # flat coloured areas that SAM merged with something else (e.g. a white shape behind a person)
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    mu = cv2.blur(gray, (7, 7))
-    local_std = np.sqrt(np.maximum(0, cv2.blur(gray * gray, (7, 7)) - mu * mu))
-    row_bg = np.array([np.median(rgb[y:y + 8].reshape(-1, 3), axis=0) for y in range(0, H, 8)]) if H >= 8 else np.zeros((1, 3))
-    bg_img = np.repeat(row_bg, 8, axis=0)[:H][:, None, :]
-    far = np.linalg.norm(rgb.astype(np.float32) - bg_img, axis=2) > 60
-    flat = (local_std < 6) & far & ~taken
-    flat = cv2.morphologyEx(flat.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    pdil = cv2.dilate(person_mask.astype(np.uint8), np.ones((15, 15), np.uint8)) > 0 if person_mask is not None else False
-    joined = flat.astype(bool) | pdil   # flat pieces around a person belong together
-    n_cc, cc = cv2.connectedComponents(joined.astype(np.uint8))
-    for i in range(1, n_cc):
-        m = (cc == i) & flat.astype(bool)
-        frac = float(m.sum()) / (W * H)
-        if frac < 0.01:
-            continue
-        ys, xs = np.where(m)
-        box = [xs.min(), ys.min(), xs.max() + 1, ys.max() + 1]
-        if any(iou(box, sh["box"]) > 0.5 for sh in shapes):
-            continue
-        shapes.append({"mask": m, "box": box, "frac": frac})
-    shapes.sort(key=lambda s: -s["frac"])
-    shapes = shapes[:6]
-    decor.sort(key=lambda d: -d["frac"])
-    decor = decor[:70]
-
-    k = max(9, int(0.03 * max(W, H))) | 1
-    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    for s in shapes:
-        m = s["mask"]
-        fill_color = np.median(rgb[m], axis=0)      # the colour of the shape itself, not of what covers it
-        if person_mask is not None:           # the part hidden behind the person belongs to the shape
-            m = m | (person_mask & (cv2.dilate(m.astype(np.uint8), kern) > 0))
-        m = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_CLOSE, kern) > 0
-        ys, xs = np.where(m)
-        box = [xs.min(), ys.min(), xs.max() + 1, ys.max() + 1]
-        src = crop_png(rgb, m, box, flat=True, max_side=512, color=fill_color)
-        if src:
-            layers.append({"type": "decor", "x": fx(box[0]), "y": fy(box[1]), "w": fx(box[2] - box[0]), "h": fy(box[3] - box[1]), "src": src, "kind": "shape"})
-            taken |= m
-    pb = [o["box"] for o in prods] + [e["box"] for e in extra]
-    band = (min(b[1] for b in pb) - 0.02 * H, max(b[3] for b in pb) + 0.02 * H) if len(pb) >= 2 else None
-    for d in decor:
-        if band and band[0] <= (d["box"][1] + d["box"][3]) / 2 <= band[1]:
-            continue                                  # lids, caps and labels of products on a shelf
-        src = crop_png(rgb, d["mask"], d["box"])
-        if src:
-            b = d["box"]
-            layers.append({"type": "decor", "x": fx(b[0]), "y": fy(b[1]), "w": fx(b[2] - b[0]), "h": fy(b[3] - b[1]), "src": src, "kind": "decoration"})
-            taken |= d["mask"]
-    # textured objects the detector missed become photo slots (a product on a shelf, a second photo)
-    extra.sort(key=lambda e: -e["frac"])
-    slots = []
-    for e in extra:
-        if all(iou(e["box"], q["box"]) < 0.3 and inside_frac(e["box"], q["box"]) < 0.6 for q in slots + prods):
-            slots.append(e)
-    for e in slots[:8]:
-        b = e["box"]
-        layers.append({"type": "product", "x": fx(b[0]), "y": fy(b[1]), "w": fx(b[2] - b[0]), "h": fy(b[3] - b[1])})
-
-    # ---- background: the pixels nobody claimed, as a vertical gradient
-    free = ~cv2.dilate(taken.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+    # background colours from the pixels no box covers: a vertical gradient
+    import cv2
+    free = ~cv2.dilate(covered.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
     stops = []
     for i in range(6):
         y0, y1 = int(H * i / 6), int(H * (i + 1) / 6)
@@ -437,52 +322,34 @@ def analyze(img):
         stops = [[0.5, hexc(np.median(rgb.reshape(-1, 3), axis=0))]]
     background = hexc(np.median(rgb[free], axis=0)) if free.sum() > 200 else stops[0][1]
 
-    # ---- photos, logos
-    for o in known:
-        if "tight" not in o:
-            continue
-        bx0, by0, bx1, by1 = o["tight"] if o["kind"] != "product" else [int(v) for v in o["box"]]
-        bx0, by0, bx1, by1 = max(0, bx0), max(0, by0), min(W, bx1), min(H, by1)
-        base = {"x": fx(bx0), "y": fy(by0), "w": fx(bx1 - bx0), "h": fy(by1 - by0)}
-        if o["kind"] == "person":
-            layers.append({"type": "person", "frame": "rounded" if o["fill"] > 0.88 else "cutout", **base})
-        elif o["kind"] == "product":
-            layers.append({"type": "product", **base})
+    def box_layer(kind, o, **extra):
+        x0, y0, x1, y1 = o["box"]
+        return {"type": kind, "x": fx(max(0, x0)), "y": fy(max(0, y0)), "w": fx(min(W, x1) - max(0, x0)), "h": fy(min(H, y1) - max(0, y0)), **extra}
+
+    for o in people:
+        m = sam_masks_for_boxes(rgb, [o["box"]])[0]
+        ys, xs = np.where(m)
+        if len(xs):
+            fill = float(m.sum()) / max(1.0, (xs.max() + 1 - xs.min()) * (ys.max() + 1 - ys.min()))
+            o = {**o, "box": [xs.min(), ys.min(), xs.max() + 1, ys.max() + 1]}
+            layers.append(box_layer("person", o, frame="rounded" if fill > 0.88 else "cutout"))
         else:
-            layers.append({"type": "logo", "align": "center", **base})
-    prod = sorted([l for l in layers if l["type"] == "product"], key=lambda l: (round(l["y"] * 8), l["x"]))   # left to right, then top to bottom
-    layers = [l for l in layers if l["type"] != "product"] + prod
+            layers.append(box_layer("person", o, frame="rounded"))
+    for o in sorted(prods, key=lambda o: (round(o["box"][1] / H * 8), o["box"][0])):
+        layers.append(box_layer("product", o))
+    for o in logos:
+        layers.append(box_layer("logo", o, align="center"))
 
-    if fallback_logo:
-        b = fallback_logo
-        layers.append({"type": "logo", "align": "center", "x": fx(b[0]), "y": fy(b[1]), "w": fx(b[2] - b[0]), "h": fy(b[3] - b[1])})
-
-    # ---- text: style each block, then give it a role
+    # text: colour, alignment and size from the pixels; the biggest block is the offer, the ones above it the headline, below it the line under
     styled = []
     for b in blocks:
         st = text_style(rgb, b)
-        x0, y0, x1, y1 = b["box"]
-        n = len(b["lines"])
         txt = " ".join(l["text"] for l in b["lines"])
-        styled.append({"b": b, "st": st, "n": n, "lh": b["lh"] / H, "text": txt, "cy": (y0 + y1) / 2 / H,
-                       "digits": any(ch.isdigit() or ch == "%" for ch in txt)})
+        styled.append({"b": b, "st": st, "n": len(b["lines"]), "lh": b["lh"] / H, "text": txt, "cy": (b["box"][1] + b["box"][3]) / 2 / H})
     roles = {}
-    styled = [x for x in styled if x["cy"] < 0.84]       # brand names / contact lines at the very bottom are never the offer or the headline
     if styled:
-        big = max(s["lh"] for s in styled)
-        cand = [s for s in styled if s["digits"] and s["lh"] >= 0.6 * big] or [max(styled, key=lambda s: s["lh"])]
-        offer = max(cand, key=lambda s: s["lh"])
+        offer = max(styled, key=lambda s: s["lh"])
         roles[id(offer)] = "offer"
-        # a button text: sits inside a small wide flat shape
-        for s in styled:
-            if s is offer:
-                continue
-            bx = s["b"]["box"]
-            for sh in shapes:
-                sb = sh["box"]
-                sw, shh = sb[2] - sb[0], sb[3] - sb[1]
-                if inside_frac(bx, sb) > 0.9 and sw / max(1, shh) > 2.0 and sw < 0.6 * W and "cta" not in roles.values():
-                    roles[id(s)] = "cta"
         for s in sorted(styled, key=lambda s: -s["lh"]):
             if id(s) in roles:
                 continue
@@ -500,8 +367,7 @@ def analyze(img):
                        "fontSize": round(s["lh"] * 1.05, 4), "uppercase": False, "lines": s["n"], "sample": s["text"][:40]})
 
     ratio = W / H
-    debug = debug_picture(rgb, layers)
     aspect = "landscape" if ratio > 1.3 else "story" if ratio < 0.62 else "portrait" if ratio < 0.9 else "square"
-    return {"aspect": aspect, "ratio": round(ratio, 4), "background": background, "gradient": stops, "layers": layers, "debug": debug,
-            "found": {"text": len(blocks), "persons": len(people), "products": len(prods), "logos": len(logos),
-                      "shapes": len(shapes), "decorations": len(decor)}}
+    return {"aspect": aspect, "ratio": round(ratio, 4), "background": background, "gradient": stops, "layers": layers,
+            "debug": debug_picture(rgb, layers),
+            "found": {"text": len(blocks), "persons": len(people), "products": len(prods), "logos": len(logos)}}
