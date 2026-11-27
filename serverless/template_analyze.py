@@ -238,6 +238,23 @@ def detect(img):
     return keep
 
 
+def detect_decor(img):
+    """Ask Grounding DINO directly for confetti, sparkles and glowing lights (the model decides what counts)."""
+    import torch
+    proc, model = get_dino()
+    inputs = proc(images=img, text="confetti. sparkles. glowing lights.", return_tensors="pt").to(_dev())
+    with torch.no_grad():
+        out = model(**inputs)
+    res = proc.post_process_grounded_object_detection(out, inputs.input_ids, threshold=0.25, text_threshold=0.2, target_sizes=[img.size[::-1]])[0]
+    boxes = res["boxes"].cpu().numpy().tolist()
+    scores = res["scores"].cpu().numpy().tolist()
+    keep = []
+    for b, sc in sorted(zip(boxes, scores), key=lambda t: -t[1]):
+        if all(iou(b, k) < 0.5 for k in keep):
+            keep.append(b)
+    return keep[:60]
+
+
 def sam_masks_for_boxes(img_np, boxes):
     """Exact mask (bool HxW) for each box, from SAM."""
     import torch
@@ -326,6 +343,16 @@ def analyze(img):
         x0, y0, x1, y1 = o["box"]
         return {"type": kind, "x": fx(max(0, x0)), "y": fy(max(0, y0)), "w": fx(min(W, x1) - max(0, x0)), "h": fy(min(H, y1) - max(0, y0)), **extra}
 
+    # confetti, sparkles, glowing lights: each piece the model finds is cut out and copied to the same place
+    decor_boxes = detect_decor(img)
+    for b, m in zip(decor_boxes, sam_masks_for_boxes(rgb, decor_boxes) if decor_boxes else []):
+        ys, xs = np.where(m)
+        if len(xs) < 20:
+            continue
+        box = [xs.min(), ys.min(), xs.max() + 1, ys.max() + 1]
+        src = crop_png(rgb, m, box)
+        if src:
+            layers.append({"type": "decor", "kind": "decoration", "x": fx(box[0]), "y": fy(box[1]), "w": fx(box[2] - box[0]), "h": fy(box[3] - box[1]), "src": src})
     for o in people:
         m = sam_masks_for_boxes(rgb, [o["box"]])[0]
         ys, xs = np.where(m)
@@ -370,4 +397,4 @@ def analyze(img):
     aspect = "landscape" if ratio > 1.3 else "story" if ratio < 0.62 else "portrait" if ratio < 0.9 else "square"
     return {"aspect": aspect, "ratio": round(ratio, 4), "background": background, "gradient": stops, "layers": layers,
             "debug": debug_picture(rgb, layers),
-            "found": {"text": len(blocks), "persons": len(people), "products": len(prods), "logos": len(logos)}}
+            "found": {"text": len(blocks), "persons": len(people), "products": len(prods), "logos": len(logos), "decorations": len(decor_boxes)}}
