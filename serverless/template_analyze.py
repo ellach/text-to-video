@@ -92,7 +92,7 @@ def png_b64(rgba):
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def crop_png(rgb, mask, box, flat=False, max_side=384):
+def crop_png(rgb, mask, box, flat=False, max_side=384, color=None):
     """Transparent PNG of `box` (x0,y0,x1,y1 in pixels): the pixels under `mask`, or a flat fill with their median colour."""
     import cv2
     x0, y0, x1, y1 = [int(v) for v in box]
@@ -102,7 +102,7 @@ def crop_png(rgb, mask, box, flat=False, max_side=384):
         return None
     px = rgb[y0:y1, x0:x1].copy()
     if flat:
-        px[:] = np.median(rgb[mask], axis=0).astype(np.uint8)
+        px[:] = (np.asarray(color) if color is not None else np.median(rgb[mask], axis=0)).astype(np.uint8)
     a = (m.astype(np.uint8) * 255)
     a = cv2.GaussianBlur(a, (3, 3), 0)
     rgba = np.dstack([px, a])
@@ -283,6 +283,16 @@ def analyze(img):
     blocks = [b for b in blocks if not any(inside_frac(b["box"], l["box"]) > 0.6 for l in logos)]
     # a "product" that is really a piece of text, or lies inside the person: drop
     people = [o for o in objs if o["kind"] == "person"]
+    # no logo found, but there is text in the bottom strip (a brand name): that is the logo place
+    fallback_logo = None
+    if not logos:
+        foot = [b for b in blocks if (b["box"][1] + b["box"][3]) / 2 > 0.84 * H]
+        if foot:
+            fx0 = min(b["box"][0] for b in foot); fy0 = min(b["box"][1] for b in foot)
+            fx1 = max(b["box"][2] for b in foot); fy1 = max(b["box"][3] for b in foot)
+            pdx, pdy = 0.02 * W, 0.015 * H
+            fallback_logo = [max(0, fx0 - pdx), max(0, fy0 - pdy), min(W, fx1 + pdx), min(H, fy1 + pdy)]
+            blocks = [b for b in blocks if b not in foot]
     # text printed on a photo or a product (labels, shirts) is part of that picture, not an editable line
     blocks = [b for b in blocks if not any(inside_frac(b["box"], o["box"]) > 0.6 for o in people + [p for p in objs if p["kind"] == "product"])]
     prods = [o for o in objs if o["kind"] == "product" and not any(inside_frac(o["box"], p["box"]) > 0.6 for p in people)
@@ -332,7 +342,7 @@ def analyze(img):
         spread = float(np.mean(np.std(rgb[m].astype(np.float32), axis=0)))
         if spread < 16 and frac > 0.01:
             shapes.append({"mask": m, "box": box, "frac": frac})
-        elif frac < 0.004 and spread < 45:
+        elif frac < 0.004 and spread < 28 and float(rgb[m].mean()) > 140:
             decor.append({"mask": m, "box": box, "frac": frac})
         elif 0.004 <= frac < 0.15 and spread >= 30:
             extra.append({"box": box, "frac": frac})
@@ -367,16 +377,21 @@ def analyze(img):
     kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     for s in shapes:
         m = s["mask"]
+        fill_color = np.median(rgb[m], axis=0)      # the colour of the shape itself, not of what covers it
         if person_mask is not None:           # the part hidden behind the person belongs to the shape
             m = m | (person_mask & (cv2.dilate(m.astype(np.uint8), kern) > 0))
         m = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_CLOSE, kern) > 0
         ys, xs = np.where(m)
         box = [xs.min(), ys.min(), xs.max() + 1, ys.max() + 1]
-        src = crop_png(rgb, m, box, flat=True, max_side=512)
+        src = crop_png(rgb, m, box, flat=True, max_side=512, color=fill_color)
         if src:
             layers.append({"type": "decor", "x": fx(box[0]), "y": fy(box[1]), "w": fx(box[2] - box[0]), "h": fy(box[3] - box[1]), "src": src, "kind": "shape"})
             taken |= m
+    pb = [o["box"] for o in prods] + [e["box"] for e in extra]
+    band = (min(b[1] for b in pb) - 0.02 * H, max(b[3] for b in pb) + 0.02 * H) if len(pb) >= 2 else None
     for d in decor:
+        if band and band[0] <= (d["box"][1] + d["box"][3]) / 2 <= band[1]:
+            continue                                  # lids, caps and labels of products on a shelf
         src = crop_png(rgb, d["mask"], d["box"])
         if src:
             b = d["box"]
@@ -419,6 +434,10 @@ def analyze(img):
             layers.append({"type": "logo", "align": "center", **base})
     prod = sorted([l for l in layers if l["type"] == "product"], key=lambda l: (round(l["y"] * 8), l["x"]))   # left to right, then top to bottom
     layers = [l for l in layers if l["type"] != "product"] + prod
+
+    if fallback_logo:
+        b = fallback_logo
+        layers.append({"type": "logo", "align": "center", "x": fx(b[0]), "y": fy(b[1]), "w": fx(b[2] - b[0]), "h": fy(b[3] - b[1])})
 
     # ---- text: style each block, then give it a role
     styled = []
