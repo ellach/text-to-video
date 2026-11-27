@@ -264,6 +264,24 @@ def auto_masks(img):
 
 
 # ------------------------------------------------------------------ 3. put it together
+def debug_picture(rgb, layers):
+    """The template with a coloured box and a name on everything that was found (for checking the analysis)."""
+    import cv2
+    img = rgb.copy()
+    H, W = img.shape[:2]
+    col = {"text": (255, 40, 40), "person": (40, 80, 255), "product": (255, 150, 0), "logo": (220, 0, 220), "shape": (0, 220, 220), "decoration": (255, 230, 0)}
+    for l in layers:
+        kind = l.get("kind") if l["type"] == "decor" else l["type"]
+        name = l.get("role") if l["type"] == "text" else (l.get("frame") and f"person ({l['frame']})") if l["type"] == "person" else kind
+        c = col.get(kind, (255, 255, 255))
+        x0, y0, x1, y1 = int(l["x"] * W), int(l["y"] * H), int((l["x"] + l["w"]) * W), int((l["y"] + l["h"]) * H)
+        cv2.rectangle(img, (x0, y0), (x1, y1), c, 3 if kind != "decoration" else 1)
+        if kind != "decoration":
+            cv2.putText(img, str(name), (x0 + 4, y0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, c, 2, cv2.LINE_AA)
+    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode() if ok else None
+
+
 def analyze(img):
     import cv2
     from PIL import Image
@@ -449,6 +467,7 @@ def analyze(img):
         styled.append({"b": b, "st": st, "n": n, "lh": b["lh"] / H, "text": txt, "cy": (y0 + y1) / 2 / H,
                        "digits": any(ch.isdigit() or ch == "%" for ch in txt)})
     roles = {}
+    styled = [x for x in styled if x["cy"] < 0.84]       # brand names / contact lines at the very bottom are never the offer or the headline
     if styled:
         big = max(s["lh"] for s in styled)
         cand = [s for s in styled if s["digits"] and s["lh"] >= 0.6 * big] or [max(styled, key=lambda s: s["lh"])]
@@ -481,7 +500,8 @@ def analyze(img):
                        "fontSize": round(s["lh"] * 1.05, 4), "uppercase": False, "lines": s["n"], "sample": s["text"][:40]})
 
     ratio = W / H
+    debug = debug_picture(rgb, layers)
     aspect = "landscape" if ratio > 1.3 else "story" if ratio < 0.62 else "portrait" if ratio < 0.9 else "square"
-    return {"aspect": aspect, "ratio": round(ratio, 4), "background": background, "gradient": stops, "layers": layers,
+    return {"aspect": aspect, "ratio": round(ratio, 4), "background": background, "gradient": stops, "layers": layers, "debug": debug,
             "found": {"text": len(blocks), "persons": len(people), "products": len(prods), "logos": len(logos),
                       "shapes": len(shapes), "decorations": len(decor)}}
